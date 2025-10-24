@@ -14,6 +14,7 @@ from sklearn.neighbors import KDTree
 from sklearn.metrics import pairwise_distances_argmin_min
 
 import pandas as pd
+
 from tqdm import tqdm
 
 from transformers import BertTokenizer, BertModel
@@ -24,6 +25,10 @@ import torch
 
 from transformers import pipeline
 from transformers import logging
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+logging.set_verbosity_warning()
 
 import itertools
 import glob
@@ -36,7 +41,7 @@ class Data_Shapley_Dataset:
 
     def __init__(self, datasets_path, outpath, metric='Accuracy', 
                  problem='classification', 
-                 model_type='logistic', C=1, 
+                 model_type='MLP_Class', C=1, 
                  hidden_layers=[32, 32], 
                  num_of_classes=None):
         
@@ -48,15 +53,9 @@ class Data_Shapley_Dataset:
         self.outpath = outpath
         self.num_of_classes = num_of_classes
         self.hidden_layers = hidden_layers
-        if self.model_type == 'logistic':
-            
-            self.hidden_layers = 0
-    
+
         self.model = create_model(self.model_type, problem=self.problem, max_epochs=1, batch_size=1,  lr=0.0001, val_frac=0.1, hidden_layer_size=self.hidden_layers, num_classes=self.num_of_classes)
-        self.values_ds_c_Dash_run = None
-        self.values_ds_tmc_run = None
-        self.values_g_shapley_run = None
-        self.loo_values = None
+        self.values_ds_FLA_SH_run = None
         self.mc_ds = None
         self.vanilia_ds = None
         self.datasets_filenames = {}
@@ -81,9 +80,6 @@ class Data_Shapley_Dataset:
             return datasets_train_df
         else:
             AssertionError('Error')
-
-    def read_txt_data(self, class_label="class"):
-        pass
 
     def read_img_data(self, class_label="class"):
         if os.path.exists(self.datasets_path):
@@ -136,9 +132,6 @@ class Data_Shapley_Dataset:
             df_.to_csv(os.path.join(out_path_dir, file_name), index=False)
             dataset_filenames.append(os.path.join(out_path_dir, file_name))
             self.datasets_filenames[file_name.split('.')[0].upper()] = os.path.join(out_path_dir, file_name)
-
-    def save_vectors(self, vectors_dict):
-        pass
 
     def convert_data_with_pca(self, data, k_dim=3):
         pca = PCA(n_components=k_dim)
@@ -206,12 +199,8 @@ class Data_Shapley_Dataset:
                 text_embeds = text_embeds.detach().cpu().numpy()
             
             out_dict[filename] = text_embeds
-            # text_embeds = model.encode(txt_, convert_to_numpy=True)
-            # out_dict[filename] = text_embeds
             class_lst.append(data.iloc[idx]['class'])
             X_embed_lst.append(text_embeds)
-            # out_df = pd.concat([out_df, pd.DataFrame({'class': [data.iloc[idx]['class']], 
-            #                                           'X_Embed': [out_dict[filename]]})])
         columns = [f"X_{i+1}" for i in range(len(X_embed_lst[0]))]
 
         # Build dataframe
@@ -509,20 +498,20 @@ class Data_Shapley_Dataset:
             AssertionError('Error on reading file, did not exists')
             
 
-    def save_output(self, method_name='C_DaSh', ):
-        if method_name == 'C_DaSh':
-            file_name = os.path.join(self.outpath, f'C_DaSh.pickle')
+    def save_output(self, method_name='fla_sh', ):
+        if method_name.lower() == 'fla_sh':
+            file_name = os.path.join(self.outpath, f'fla_sh.pickle')
         else:
             file_name = os.path.join(self.outpath, f'ds.pickle')
         with open(os.path.join(file_name), 'wb') as handle:
             
-                pkl.dump(self.values_ds_c_Dash_run, handle, protocol=pkl.HIGHEST_PROTOCOL)
+                pkl.dump(self.values_ds_FLA_SH_run, handle, protocol=pkl.HIGHEST_PROTOCOL)
 
-    def load_values(self, filepath, method_name='C_DaSh'):
+    def load_values(self, filepath, method_name='fla_sh'):
         with open(filepath, 'rb') as handle:
-            if method_name == 'C_DaSh':
+            if method_name.lower() == 'fla_sh':
                 b = pkl.load(handle)
-                self.values_ds_c_Dash_run = b
+                self.values_ds_FLA_SH_run = b
 
     def get_score(self, X, y, use_img=False, use_NN=False, lr=0.0001, max_epochs=1, batch_size=1, val_frac=0.1, data_type='tabular'):
         if data_type == 'text':
@@ -705,6 +694,7 @@ class Data_Shapley_Dataset:
                 print(selected_subsets)
             if ret_embeds:
                 return out_shapley_values, out_avg, X_embed
+            self.values_ds_FLA_SH_run = out_shapley_values
             return out_shapley_values, out_avg
         else:
             # Did the same for a single datasets which has already perform chunk partitioning
@@ -727,6 +717,7 @@ class Data_Shapley_Dataset:
                 print(f'Selected subsets : ')
                 print(selected_subsets)
             dataset_avg = np.mean(list(Shap_values_dict.values()))
+            self.values_ds_FLA_SH_run = Shap_values_dict
             if ret_embeds:
                 return out_shapley_values, out_avg, X_embed
             return Shap_values_dict, dataset_avg
@@ -852,7 +843,7 @@ class Data_Shapley_Dataset:
         n = len(data_dict)
         if n <=1:
             Shap_values_dict = {key: 0 for i, key in enumerate(data_dict.keys())}
-            self.values_ds_c_Dash_run = Shap_values_dict
+            self.values_ds_FLA_SH_run = Shap_values_dict
             return Shap_values_dict
         if n < total_subset:
             print(f'Change subset size to the length of the chunks to {n/2}, because cannot be the chunk size k > n')
@@ -1065,7 +1056,7 @@ class Data_Shapley_Dataset:
 
         print(f'Final Trancation error : {calculate_error(memory_ds)}')
         Shap_values_dict = {key: np.mean(memory_ds[i]) for i, key in enumerate(data_dict.keys())}
-        self.values_ds_c_Dash_run = Shap_values_dict
+        self.values_ds_FLA_SH_run = Shap_values_dict
         
         if show_subsets:
             return Shap_values_dict, subset_names
