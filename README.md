@@ -1,2 +1,14 @@
-# FLA-SH
-A Chunked Data Shapley appeoximation where estimates Shapley values per chunk
+# FLA-SH: fast, Heterogeneous Dataset QuaLity Assessment via SHapley Values
+A Chunked Data Shapley approximation where estimates Shapley values per chunk by implementing a chunk partitioning and a sampling permutation we prioritise to select the most probably high quality chunks during the subset selection.
+
+### Dependencies:
+1. `Python` version 3.9.21
+2. `numpy=1.22.0 `
+3. `pandas=1.3.5`
+4. `pytorch=2.4.0`
+5. `scikit-learn=1.6.1`
+6. `scipy=1.8.0`
+7. `tqdm=4.67.1`
+8. `transformers=4.57.1`
+9. `cv2-contrib=4.12`
+10. `hilbertcurve=2.0.5`
