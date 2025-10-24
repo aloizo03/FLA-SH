@@ -1,6 +1,3 @@
-import matplotlib
-
-matplotlib.use('Agg')
 import numpy as np
 import os
 import cv2
@@ -17,8 +14,6 @@ from sklearn.neighbors import KDTree
 from sklearn.metrics import pairwise_distances_argmin_min
 
 import pandas as pd
-
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from transformers import BertTokenizer, BertModel
@@ -29,10 +24,6 @@ import torch
 
 from transformers import pipeline
 from transformers import logging
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
-logging.set_verbosity_warning()
 
 import itertools
 import glob
