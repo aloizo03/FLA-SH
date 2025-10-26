@@ -343,7 +343,7 @@ class Data_Shapley_Dataset:
         self.idx_to_label = {i: label for label, i in self.label_to_idx.items()}
         self.num_of_classes = len(class_unique)
 
-    def split_data(self, chunk_size, split_by='random', save_it=False, data_type='tabular', convert_labels=False, X_embeds=None):
+    def split_data(self, chunk_size, split_by='ordered', save_it=False, data_type='tabular', convert_labels=False, X_embeds=None):
         if os.path.exists(self.datasets_path):
             out_dict = {}
             if data_type.lower() == 'image' or data_type.lower() == 'img':
@@ -356,7 +356,7 @@ class Data_Shapley_Dataset:
                     self.labels_to_idx(df=df_img_info)
                     df_img_info['class'] = df_img_info['class'].map(self.label_to_idx)
                 X_embds_ret=None
-                if split_by == 'random':
+                if split_by == 'ordered':
                     df_chunks = np.array_split(df_img_info, chunk_size)
                 elif split_by.lower() == 'tree':
                     img_data = {row['file_path']: cv2.imread(row['file_path']) for index, row in df_img_info.iterrows()}
@@ -391,7 +391,7 @@ class Data_Shapley_Dataset:
                     file_name = file.split('/')[-1].split('.')[0].upper()
                     X_embds_ret=None
                     df_file = df_file.fillna(-99)
-                    if split_by == 'random':
+                    if split_by == 'ordered':
                         df_chunks = np.array_split(df_file, chunk_size)
                     elif split_by == 'date':
                         try:
@@ -435,7 +435,7 @@ class Data_Shapley_Dataset:
 
                 X_embds = [embds for _, embds in X_embds.items()]
                 X_embds = np.asarray(X_embds, dtype=np.float64)
-                if split_by == 'random':
+                if split_by == 'ordered':
                         df_chunks = np.array_split(df_text_info, chunk_size)
                         X_embds_ret = np.array_split(X_embds, chunk_size)
                 elif split_by.lower() == 'tree':
@@ -462,7 +462,7 @@ class Data_Shapley_Dataset:
                 X_embds = X_embds_df.values.tolist()
                 X_embds = np.asarray(X_embds, dtype=np.float64)
 
-                if split_by == 'random':
+                if split_by == 'ordered':
                         df_chunks = np.array_split(df_info, chunk_size)
                         X_embds_ret = np.array_split(X_embds, chunk_size)
                 elif split_by.lower() == 'tree':
@@ -669,7 +669,7 @@ class Data_Shapley_Dataset:
         self.tol = np.std(scores)
         self.mean_score = np.mean(scores)
     
-    def execute_per_dataset(self, split_data=False, chunk_size=200, k=50, split_by='random', use_hilbert_kernel=False, err=0.9,th=0.5, smart_selection=True, show_subsets=False, data_type='tabular', use_perm=True, ret_embeds=False, convert_label=False):
+    def execute_per_dataset(self, split_data=False, chunk_size=200, k=50, split_by='ordered', use_hilbert_kernel=False, err=0.9,th=0.5, smart_selection=True, show_subsets=False, data_type='tabular', use_perm=True, ret_embeds=False, convert_label=False):
         # Check if we need to split data to chunks with chunk partitioning 
         if split_data:
             # Apply chunk partitioning and create chunks
