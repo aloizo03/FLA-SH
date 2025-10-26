@@ -41,6 +41,6 @@ Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, 
 - `text`
 - `vectors` (when vector embeddings are provided)
 
-#### Permutation Method
+#### Permutation Options
 - `hilbert_kernel=False` → unified ratio sampling permutation
 - `hilbert_kernel=True` → Hilbert kernel permutation
