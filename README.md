@@ -12,3 +12,35 @@ A Chunked Data Shapley approximation where estimates Shapley values per chunk by
 8. `transformers=4.57.1`
 9. `cv2-contrib=4.12`
 10. `hilbertcurve=2.0.5`
+
+### Run Data-Shapley example
+
+For tabular data:
+```
+DS = Data_Shapley_Dataset(datasets_path='/path/to/csv/dir/',
+                          outpath='Output/results/',
+                          metric='Accuracy',
+                          problem='classification',
+                          model_type='MLP_Class')
+
+Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, chunk_size=256, split_by='cluster', data_type='tabular', k=50, use_hilbert_kernel=False)
+```
+
+#### Split Options
+
+##### `split_by`
+- `cluster` – K-Means clustering
+- `trees` – KD-Trees
+- `ordered` – ordering-based split
+
+##### Time-Series Datasets
+- `split_by='date'` or `'month'` splits data chronologically by day or month, respectively.
+
+#### `data_type`
+- `image`
+- `text`
+- `vectors` (when vector embeddings are provided)
+
+#### Permutation Method
+- `hilbert_kernel=False` → unified ratio sampling permutation
+- `hilbert_kernel=True` → Hilbert kernel permutation
