@@ -344,6 +344,8 @@ class Data_Shapley_Dataset:
         self.num_of_classes = len(class_unique)
 
     def split_data(self, chunk_size, split_by='ordered', save_it=False, data_type='tabular', convert_labels=False, X_embeds=None):
+        ## Acceptable data_types: image, text, tabular, vectors
+        ## Acceptable split_type: ordered, tree, cluster
         if os.path.exists(self.datasets_path):
             out_dict = {}
             if data_type.lower() == 'image' or data_type.lower() == 'img':
@@ -445,7 +447,7 @@ class Data_Shapley_Dataset:
                 elif split_by.lower() == 'cluster':
                     chunk_idxs = self.split_by_cluster(chunk_size=chunk_size, data_tuples_embds=X_embds)
                     df_chunks = [df_text_info.iloc[list(idxs)] for idxs in chunk_idxs.values()]
-                    X_embds_ret = [X_embds[idxs] for idxs in chunk_idxs.values()]
+                    X_embds_ret = None
                 
                 file_dict = {f'{file_name}_{i}.csv': df_ for i, df_ in enumerate(df_chunks)}
                 if save_it:
