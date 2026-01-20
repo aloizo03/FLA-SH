@@ -12,25 +12,38 @@ class GroupDRO:
         self.n_groups = n_groups
         self.eta = eta
         self.device = device
-        self.q = torch.ones(n_groups, device=device) / n_groups  # group weights
+        self.q = torch.ones(n_groups, device=device) / n_groups
 
+    @torch.no_grad()
     def update(self, group_losses):
-        # group_losses: tensor of shape (n_groups,)
-        self.q *= torch.exp(self.eta * group_losses.detach())
+        self.q *= torch.exp(self.eta * group_losses)
         self.q /= self.q.sum()
 
     def loss(self, group_losses):
-        return torch.dot(self.q, group_losses) 
+        q = self.q.detach()
+        return torch.sum(q * group_losses)
+
     
-def group_dro(group_dr: GroupDRO, groups_, x_predict, loss_err):
-    group_losses = torch.zeros(group_dro.n_groups, device=group_dr.device)
-    for i in range(group_dro.n_groups):
-        mask = (groups_ == i)
+def group_dro_loss(
+    group_dro: GroupDRO,
+    groups,
+    per_sample_losses):
+    
+    device = group_dro.device
+    group_losses = torch.zeros(group_dro.n_groups, device=device)
+
+    for g in range(group_dro.n_groups):
+        mask = (groups == g)
         if mask.any():
-            group_losses[i] = loss_err[mask].mean()
-    
-    dro_loss = group_dro.loss(group_losses)
-    return dro_loss
+            group_losses[g] = per_sample_losses[mask].mean()
+        else:
+            # Important: zero loss but does not influence q
+            group_losses[g] = 0.0
+
+    group_dro.update(group_losses.detach())
+
+    return group_dro.loss(group_losses)
+
 
 def demographic_parity_loss_multi(logits, protected_attr):
     """
@@ -78,7 +91,8 @@ def transform_to_torch(arr):
         tens = tens.squeeze(0)
     return tens
 
-def get_metric(metric, y_pred, y, clf=None, X=None):
+def get_metric(metric, y_pred, y, clf=None, X=None, use_fairness=False):
+
     if metric.lower() == 'accuracy':
         return accuracy_score(y, y_pred)
     elif metric.lower() == 'f1-score':

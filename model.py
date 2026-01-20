@@ -11,13 +11,13 @@ from sklearn.preprocessing import scale
 from sklearn.preprocessing import minmax_scale
 from collections import Counter
 
-from utils import transform_to_torch, get_metric
+from utils import transform_to_torch, get_metric, GroupDRO, group_dro_loss
 
 
 class NN_model(nn.Module):
 
     def __init__(self, mode_problem='classification', use_img=False, hidden_layers=[100], optimizer='sgd', batch_size=128, max_epoch=100,  validation_fraction=0.1,
-                 early_stopping=15, address=None, test_batch_size=1000, random_seed=666, lr=0.001, num_of_classes=None, normalize=True, device=None):
+                 early_stopping=15, address=None, test_batch_size=1000, random_seed=666, lr=0.001, num_of_classes=None, normalize=True, device=None, use_fairness=False, fairness_attr=0, num_of_fair=2, lambda_fair=1.0):
         super().__init__()
         self.problem = mode_problem
         self.hidden_layers=hidden_layers
@@ -44,7 +44,13 @@ class NN_model(nn.Module):
             raise ValueError('Problem must be either classification or regression')
         self.is_built = False
 
-    def fit(self, X, y, X_val, y_val, use_val=True, epochs=None, batch_size=None, save=False, load=False, sample_weight=None, data_dict=None, use_datasets=True, metric='accuracy', show_progr=False):
+        self.use_fairness = use_fairness
+        self.fairness_attr = fairness_attr
+        self.num_of_fair = num_of_fair
+        self.lambda_fair = lambda_fair
+
+
+    def fit(self, X, y, X_val, y_val, use_val=True, epochs=None, batch_size=None, save=False, load=False, sample_weight=None, data_dict=None, use_chunks=True, metric='accuracy', show_progr=False, fair_attrbs=None, fair_attrbs_val=None):
 
         if isinstance(y, list):
             # all_y = pd.concat(y, axis=0).to_numpy().ravel().tolist()
@@ -65,7 +71,7 @@ class NN_model(nn.Module):
             if self.num_classes is None:
                 all_y = y.ravel().tolist()
                 self.num_classes = len(set(all_y))
-       
+
         self.metric = metric
 
         if epochs is None:
@@ -94,53 +100,91 @@ class NN_model(nn.Module):
                 all_y = y.to_numpy()   
             
             self.build(all_X, all_y)
+        
+        fair_train = None
+        fair_val = None
 
         if len(X) > 0 and not X is None:
-            if use_datasets:
-                
+            if use_chunks:
                 if X_val is None and use_val:
                     X_train_lst = []
                     X_val_lst = []
                     y_train_lst = []
                     y_val_lst = []
-                    
+                    fair_train = []
+                    fair_val = []
                     if isinstance(X, pd.DataFrame) and isinstance(y, pd.DataFrame):
-                        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=self.val_fraction)
+                        if self.use_fairness is not True:
+                            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=self.val_fraction)
+                        else:
+                           X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrb_val = train_test_split(X, y, fair_attrbs, test_size=self.val_fraction)
+                           fair_train.append(fair_attrbs_train)
+                           fair_val.append(fair_attrb_val)
                         X_train_lst.append(X_train)
+
                         X_val_lst.append(X_val)
                         y_train_lst.append(y_train)
                         y_val_lst.append(y_val)
                     elif isinstance(X, np.ndarray) and isinstance(y, np.ndarray):
-                        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=self.val_fraction)
+                        if self.use_fairness is not True:
+                            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=self.val_fraction)
+                        else:
+                           X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrb_val = train_test_split(X, y, fair_attrbs, test_size=self.val_fraction)
+                           fair_train.append(fair_attrbs_train)
+                           fair_val.append(fair_attrb_val)
+
                         X_train_lst.append(X_train)
                         X_val_lst.append(X_val)
                         y_train_lst.append(y_train)
                         y_val_lst.append(y_val)
                     elif isinstance(X, list) and isinstance(y, list):
-                        for X_, y_ in zip(X, y):
-                            X_np = X_
-                            y_np = y_
-                            
-                            X_train, X_val, y_train, y_val = train_test_split(X_np, y_np, test_size=self.val_fraction)
+                        if self.use_fairness is not True:
+                            for X_, y_ in zip(X, y):
+                                X_train, X_val, y_train, y_val = train_test_split(X_, y_, test_size=self.val_fraction)
 
-                            X_train_lst.append(X_train)
-                            X_val_lst.append(X_val)
-                            y_train_lst.append(y_train)
-                            y_val_lst.append(y_val)            
+                                X_train_lst.append(X_train)
+                                X_val_lst.append(X_val)
+                                y_train_lst.append(y_train)
+                                y_val_lst.append(y_val)
+                        else:
+                            if isinstance(fair_attrbs, list):
+                                for X_, y_, fair_attrb in zip(X, y, fair_attrbs):
+                                    X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrb_val = train_test_split(X_, y_, fair_attrb, test_size=self.val_fraction)
+                                    X_train_lst.append(X_train)
+                                    X_val_lst.append(X_val)
+                                    y_train_lst.append(y_train)
+                                    y_val_lst.append(y_val)
+
+                                    fair_train.append(fair_attrbs_train)
+                                    fair_val.append(fair_attrb_val)
                 else:
+                    if self.use_fairness:
+                        fair_train = fair_attrbs
+                        fair_val = fair_attrbs_val
                     X_train_lst, y_train_lst, X_val_lst, y_val_lst = X, y, X_val, y_val
             else:
                 if X_val is None and self.val_fraction * len(X) > 2 and use_val:
                     if isinstance(X, pd.DataFrame) and isinstance(y, pd.DataFrame):
-                        
-                        X_train_lst, X_val_lst, y_train_lst, y_val_lst = train_test_split(X, y, test_size=self.val_fraction)
-                        X_train_lst, y_train_lst = X_np, y_np
+                        if self.use_fairness:
+                            X_train_lst, X_val_lst, y_train_lst, y_val_lst, fair_train, fair_val = train_test_split(X, y, fair_attrbs, test_size=self.val_fraction)
+                        else:
+                            X_train_lst, X_val_lst, y_train_lst, y_val_lst = train_test_split(X, y, test_size=self.val_fraction)
+                        # X_train_lst, y_train_lst = X_np, y_np
+
                     elif isinstance(X, np.ndarray) and isinstance(y, np.ndarray):
-                        X_train_lst, X_val_lst, y_train_lst, y_val_lst = train_test_split(X, y, test_size=self.val_fraction)
-                        X_train_lst, y_train_lst = X, y
+                        if self.use_fairness:
+                            # if isinstance(fair_attrbs, pd.DataFrame):
+                            #     fair_attrbs = 
+                            X_train_lst, X_val_lst, y_train_lst, y_val_lst, fair_train, fair_val= train_test_split(X, y, fair_attrbs, test_size=self.val_fraction)
+                        else:
+                            X_train_lst, X_val_lst, y_train_lst, y_val_lst = train_test_split(X, y, test_size=self.val_fraction)
+                        # X_train_lst, y_train_lst = X, y
                     elif isinstance(X, list) and isinstance(y, list):
-                        X_train_lst, X_val_lst, y_train_lst, y_val_lst = train_test_split(X, y, test_size=self.val_fraction)
-                        X_train_lst, y_train_lst = X_np, y_np
+                        if self.use_fairness:
+                            X_train_lst, X_val_lst, y_train_lst, y_val_lst, fair_train, fair_val = train_test_split(X, y, fair_attrbs, test_size=self.val_fraction)
+                        else:
+                            X_train_lst, X_val_lst, y_train_lst, y_val_lst = train_test_split(X, y, test_size=self.val_fraction)
+                        # X_train_lst, y_train_lst = X_np, y_np
                 else:
                     if isinstance(X, pd.DataFrame) and isinstance(y, pd.DataFrame):
                         X = X.to_numpy()
@@ -149,9 +193,10 @@ class NN_model(nn.Module):
                         X_val = X_val.to_numpy()
                         y_val = y_val.to_numpy()
                     X_train_lst, y_train_lst, X_val_lst, y_val_lst = X, y, X_val, y_val
-
-            
-            self.training_(X=X_train_lst, y=y_train_lst, X_val=X_val_lst, y_val=y_val_lst, use_val=use_val, max_epochs=epochs, batch_size=batch_size, data_dict=data_dict, show_progr=show_progr)
+                    if self.use_fairness:
+                        fair_train = fair_attrbs
+                        fair_val = fair_attrbs_val
+            self.training_(X=X_train_lst, y=y_train_lst, X_val=X_val_lst, y_val=y_val_lst, fair_train=fair_train, fair_val=fair_val, use_val=use_val, max_epochs=epochs, batch_size=batch_size, data_dict=data_dict, show_progr=show_progr)
 
     def build(self, X, y, bias=True, init_=True, data_dict=None):
         self.is_built = True
@@ -187,7 +232,7 @@ class NN_model(nn.Module):
         
         self.layers_.add_module('out_layer', out_layer)
 
-    def training_(self, X, y, X_val, y_val, use_val, max_epochs, batch_size, data_dict, show_progr):
+    def training_(self, X, y, X_val, y_val, fair_train, fair_val, use_val, max_epochs, batch_size, data_dict, show_progr):
         assert len(X)==len(y), 'Input and labels not the same size'
         self.history = {'metrics':[], 'idxs':[], 'keys':[]}
         stop_counter = 0
@@ -218,8 +263,7 @@ class NN_model(nn.Module):
                         X_val = preprocessing.normalize(X_val)
                             
         for epoch in range(max_epochs):
-            
-            idxs, val_metrics, keys_lst = self.one_epoch_iter(X=X, y=y, X_val=X_val, y_val=y_val, use_val=use_val, batch_size=batch_size, data_dict=data_dict, optimiser=optimiser)
+            idxs, val_metrics, keys_lst = self.one_epoch_iter(X=X, y=y, X_val=X_val, y_val=y_val, use_val=use_val, fair_train=fair_train, fair_val=fair_val, batch_size=batch_size, data_dict=data_dict, optimiser=optimiser)
             self.history['metrics'] = val_metrics
             self.history['idxs'] = idxs
             self.history['keys'] = keys_lst
@@ -239,24 +283,51 @@ class NN_model(nn.Module):
                         print(f'Finishing at epoch {epoch} because at erply stoping at the last {stop_counter} epochs with best performance {best_performance}')
                         break
             
-
-    def one_epoch_iter(self, X, y, X_val, y_val, use_val, batch_size, optimiser, data_dict=None):
+    def one_epoch_iter(self, X, y, X_val, y_val, fair_train, fair_val, use_val, batch_size, optimiser, data_dict=None,):
         val_metrics = []
         keys_lst = []
         if self.use_img:
+            # Todo: fairness for images
             if data_dict is None:
                 idxs = np.random.permutation(len(X))
+                
                 if isinstance(X_val, np.ndarray) or isinstance(X_val, pd.DataFrame):
-                    batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                    if self.use_fairness:
+                        if isinstance(fair_train, pd.DataFrame):
+                            # fair_train is sliced, fair_val is passed whole (matching X_val)
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val, y_val, fair_train.iloc[k*batch_size : (k+1)*batch_size], fair_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val, y_val, fair_train[k*batch_size : (k+1)*batch_size], fair_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                    else:
+                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                
                 elif isinstance(X_val, list) and isinstance(y_val, list):
-                    batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val[k*batch_size : (k+1)*batch_size], y_val[k*batch_size : (k+1)*batch_size]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                    if self.use_fairness:
+                        if isinstance(fair_train, pd.DataFrame):
+                            # fair_train is sliced, fair_val is sliced (matching X_val)
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val[k*batch_size : (k+1)*batch_size], y_val[k*batch_size : (k+1)*batch_size], fair_train.iloc[k*batch_size : (k+1)*batch_size], fair_val.iloc[k*batch_size : (k+1)*batch_size]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val[k*batch_size : (k+1)*batch_size], y_val[k*batch_size : (k+1)*batch_size], fair_train[k*batch_size : (k+1)*batch_size], fair_val[k*batch_size : (k+1)*batch_size]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                    else:
+                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], X_val[k*batch_size : (k+1)*batch_size], y_val[k*batch_size : (k+1)*batch_size], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                
                 elif use_val is not True:
                     if isinstance(X, np.ndarray) or isinstance(X, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, pd.DataFrame):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None, fair_train.iloc[k*batch_size : (k+1)*batch_size], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None, fair_train[k*batch_size : (k+1)*batch_size], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, list) and isinstance(y, list):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
-                
-                
+                        if self.use_fairness:
+                            if isinstance(fair_train, pd.DataFrame):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None, fair_train.iloc[k*batch_size : (k+1)*batch_size], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None, fair_train[k*batch_size : (k+1)*batch_size], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k*batch_size : (k+1)*batch_size], y[k*batch_size : (k+1)*batch_size], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
             else:
                 idxs = np.random.permutation(len(data_dict.keys()))
                 keys_lst = list(data_dict.keys())    
@@ -268,79 +339,200 @@ class NN_model(nn.Module):
                 idxs = np.random.permutation(len(X))
                 if isinstance(X_val, np.ndarray) or isinstance(X_val, pd.DataFrame):
                     if isinstance(X, np.ndarray) and isinstance(y, np.ndarray):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, pd.DataFrame) and isinstance(y, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, pd.DataFrame) and isinstance(y, np.ndarray):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, np.ndarray) and isinstance(y, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]                  
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, list) and isinstance(y, list):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+
+                # When val is list
                 elif isinstance(X_val, list) and isinstance(y_val, list):
                     if isinstance(X, np.ndarray) and isinstance(y, np.ndarray):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, pd.DataFrame) and isinstance(y, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, pd.DataFrame) and isinstance(y, np.ndarray):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, np.ndarray) and isinstance(y, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k],  X_val, y_val) for k in range(int(np.ceil(len(idxs)/batch_size)))]                  
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], X_val, y_val, fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], X_val, y_val, fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], X_val, y_val, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, list) and isinstance(y, list):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val[k], y_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val[k], y_val[k], fair_train.iloc[k], fair_val.iloc[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val[k], y_val[k], fair_train[k], fair_val[k]) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], X_val[k], y_val[k], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]   
+                #  WHen validation is None
                 else:
                     if isinstance(X, np.ndarray) and isinstance(y, np.ndarray):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None, fair_train.iloc[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None, fair_train[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, pd.DataFrame) and isinstance(y, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], None, None, fair_train.iloc[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], None, None, fair_train[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y.iloc[k], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, pd.DataFrame) and isinstance(y, np.ndarray):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], None, None, fair_train.iloc[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], None, None, fair_train[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X.iloc[k], y[k], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, np.ndarray) and isinstance(y, pd.DataFrame):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]                  
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], None, None, fair_train.iloc[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], None, None, fair_train[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y.iloc[k], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
                     elif isinstance(X, list) and isinstance(y, list):
-                        batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        if self.use_fairness:
+                            if isinstance(fair_train, (pd.DataFrame, pd.Series)):
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None, fair_train.iloc[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                            else:
+                                batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None, fair_train[k], None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
+                        else:
+                            batches = [(idxs[k*batch_size : (k+1)*batch_size], X[k], y[k], None, None, None, None) for k in range(int(np.ceil(len(idxs)/batch_size)))]
             else:
                 idxs = np.random.permutation(len(data_dict.keys()))
                 keys_lst = list(data_dict.keys())    
-        
-                batches = [(keys_lst[int(i)], X[i], y[i], X_val[i], y_val[i]) for i in idxs]
+                if self.use_fairness:
+                    batches = [(keys_lst[int(i)], X[i], y[i], X_val[i], y_val[i], fair_train[i], fair_val[i]) for i in idxs]
+                else:
+                    batches = [(keys_lst[int(i)], X[i], y[i], X_val[i], y_val[i], None, None) for i in idxs]
+
+        if self.use_fairness:
+            loss_fair_fn = GroupDRO(n_groups=self.num_of_fair, device=self.device)
 
         if self.problem == "classification":
-            loss_fn = nn.CrossEntropyLoss().to(self.device)
+            loss_fn = nn.CrossEntropyLoss(reduction='mean').to(self.device)
+            loss_fn_none = nn.CrossEntropyLoss(reduction='none').to(self.device)
         elif self.problem == "regression":
-            loss_fn = nn.MSELoss()
+            loss_fn = nn.MSELoss(reduction='mean').to(self.device)
+            loss_fn_none = nn.MSELoss(reduction='none').to(self.device)
 
         for idx, batch in enumerate(batches):
-            key_, X_batch, y_batch, X_val_batch, y_val_batch = batch
+            key_, X_batch, y_batch, X_val_batch, y_val_batch, fair_train_batch, fair_val_batch = batch
             self.train()
 
             X_batch = transform_to_torch(X_batch).to(self.device)
             y_batch = transform_to_torch(y_batch).to(self.device)
+            y_batch = y_batch.ravel()
+
+            if X_batch.ndim == 1:
+                X_batch = X_batch.unsqueeze(0)
+            
+            if self.use_img and X_batch.ndim == 3:
+                X_batch = X_batch.unsqueeze(0)
+
+            if self.use_fairness:
+                fair_train_batch = transform_to_torch(fair_train_batch).to(self.device).long()
+                if use_val:
+                    fair_val_batch = transform_to_torch(fair_val_batch).to(self.device).long()
+            
             if use_val:
                 X_val_batch = transform_to_torch(X_val_batch).to(self.device)
-                y_val_batch = transform_to_torch(y_val_batch).to(self.device)
-
-            y_batch = y_batch.ravel()
-            if use_val:
-                y_val_batch = y_val_batch.ravel()
+                y_val_batch = transform_to_torch(y_val_batch).to(self.device).ravel()
+                
+                if X_val_batch.ndim == 1:
+                    X_val_batch = X_val_batch.unsqueeze(0)
 
             optimiser.zero_grad()
+            
             y_pred = self.predict(X_batch)
+            
+            per_sample_losses = None
+
             if self.problem == "classification":
-                if self.use_img:
-                    y_batch = y_batch.long()
-                    loss = loss_fn(y_pred, y_batch)
-                else:
-                    if len(y_pred.shape) == 2:
-                        y_pred_max = torch.argmax(y_pred ,axis=1).type(torch.float)
-                    else:
-                        y_pred_max = torch.argmax(y_pred.reshape(1, -1), axis=1).type(torch.float)
-                    loss = loss_fn(y_pred_max, y_batch)
-                    if self.problem == "classification":
-                        loss.requires_grad = True
-            else:
+                y_batch = y_batch.long()
+                
+                loss = loss_fn(y_pred, y_batch)
+                
+                if self.use_fairness:
+                    per_sample_losses = loss_fn_none(y_pred, y_batch)
+            
+            else: 
                 y_batch = y_batch.reshape(-1, 1)
                 loss = loss_fn(y_pred, y_batch)
+
+                if self.use_fairness:
+                    per_sample_losses = loss_fn_none(y_pred, y_batch)
+                    if per_sample_losses.ndim > 1:
+                        per_sample_losses = per_sample_losses.mean(dim=1)
+
+            if self.use_fairness and per_sample_losses is not None:
+                dro_term = group_dro_loss(loss_fair_fn, fair_train_batch, per_sample_losses)
+                loss = loss + self.lambda_fair * dro_term
                         
             loss.backward()
             optimiser.step()
@@ -348,20 +540,43 @@ class NN_model(nn.Module):
             keys_lst.append(key_)
 
             if use_val:
-
-                val_metric = self.validation(X=X_val_batch, y=y_val_batch)
+                if self.use_fairness:
+                    val_metric = self.validation(X=X_val_batch, y=y_val_batch, fair_val=fair_val_batch, loss_fn=loss_fn_none, loss_fair_fn=loss_fair_fn)
+                else:
+                    val_metric = self.validation(X=X_val_batch, y=y_val_batch, fair_val=fair_val_batch, loss_fn=loss_fn_none, loss_fair_fn=None)
                 val_metrics.append(val_metric)
 
         return idxs, val_metrics, keys_lst
 
-    def validation(self, X, y):
+    def validation(self, X, y, fair_val, loss_fn, loss_fair_fn,):
         self.eval()
         with torch.no_grad():
-            y_pred = self.predict(X)
-            y_pred_max = torch.argmax(y_pred, dim=1)   # keep as long/int
+            y_pred = self.predict(X) 
+            
+            if self.problem == "classification":
+                y = y.long()
+                y_pred_max = torch.argmax(y_pred, dim=1)
+                y_pred_metric = y_pred_max.cpu().numpy()
+                
+                # Use logits for loss
+                val_loss_per_sample = loss_fn(y_pred, y)
+            else:
+                y = y.reshape(-1, 1)
+                y_pred_metric = y_pred.cpu().numpy()
+                val_loss_per_sample = loss_fn(y_pred, y)
+                if val_loss_per_sample.ndim > 1:
+                    val_loss_per_sample = val_loss_per_sample.mean(dim=1)
+
             y_true = y.cpu().numpy()
-            y_pred_np = y_pred_max.cpu().numpy()
-            return get_metric(metric=self.metric, y_pred=y_pred_np, y=y_true)
+
+            # Calculate metric
+            metric_val = get_metric(metric=self.metric, y_pred=y_pred_metric, y=y_true, use_fairness=self.use_fairness)
+
+            if self.use_fairness:
+                loss_fair = self.lambda_fair * group_dro_loss(loss_fair_fn, fair_val, val_loss_per_sample)
+                metric_val = metric_val - loss_fair.item()
+                
+            return metric_val
    
 
     def predict(self, X):
@@ -371,9 +586,9 @@ class NN_model(nn.Module):
 
 class CNN_Model(NN_model):
 
-    def __init__(self, mode_problem='classification', hidden_layers=[100], optimizer='sgd', batch_size=128, max_epoch=100, validation_fraction=0.1, early_stopping=0, address=None, test_batch_size=1000, random_seed=666, lr=0.001, normalize=True, device=None, strides=[2], kernel_sizes=[2], channels=[1], global_averaging=False, dropout=0, num_of_classes=2):
+    def __init__(self, mode_problem='classification', hidden_layers=[100], optimizer='sgd', batch_size=128, max_epoch=100, validation_fraction=0.1, early_stopping=0, address=None, test_batch_size=1000, random_seed=666, lr=0.001, normalize=True, device=None, strides=[2], kernel_sizes=[2], channels=[1], global_averaging=False, dropout=0, num_of_classes=2,use_fairness=False, fairness_attr=[0], num_of_fair=2, lambda_fair=1.0):
 
-        super().__init__(mode_problem, True, hidden_layers, optimizer, batch_size, max_epoch, validation_fraction, early_stopping, address, test_batch_size, random_seed, lr, num_of_classes, normalize, device)
+        super().__init__(mode_problem, True, hidden_layers, optimizer, batch_size, max_epoch, validation_fraction, early_stopping, address, test_batch_size, random_seed, lr, num_of_classes, normalize, device, use_fairness, fairness_attr, num_of_fair, lambda_fair)
         if strides is None:
             self.strides = [1] * len(kernel_sizes)
         else:

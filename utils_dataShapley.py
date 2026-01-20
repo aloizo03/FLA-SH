@@ -12,7 +12,9 @@ from sklearn.metrics import pairwise_distances_argmin_min
 
 from CNN_Test_model import Cnn_Model_3Layers
 
-def create_model(model_type, problem, max_epochs, batch_size, lr, val_frac, hidden_layer_size=(20,), use_img=False, use_NN=True, num_classes=10, norm=True):
+def create_model(model_type, problem, max_epochs, batch_size, lr, val_frac, hidden_layer_size=(20,), 
+                 use_img=False, use_NN=True, num_classes=10, norm=True, use_fairness=False, fairness_attr=0, num_of_fair=2, lambda_fair=1.0):
+    
     if model_type == 'logistic':
         model = LogisticRegression(n_jobs=2,
                                    max_iter=3000,
@@ -27,7 +29,11 @@ def create_model(model_type, problem, max_epochs, batch_size, lr, val_frac, hidd
                                             lr=lr, validation_fraction=val_frac, optimizer='sgd', address=None, 
                                             hidden_layers=hidden_layer_size,
                                             num_of_classes=num_classes,
-                                            normalize=norm)
+                                            normalize=norm,
+                                            use_fairness=use_fairness,
+                                            fairness_attr=fairness_attr, 
+                                            num_of_fair=num_of_fair,
+                                            lambda_fair=lambda_fair)
         else:
             model = MLPRegressor(hidden_layer_sizes=hidden_layer_size,
                              activation='relu', 
@@ -50,14 +56,19 @@ def create_model(model_type, problem, max_epochs, batch_size, lr, val_frac, hidd
                                 hidden_layers=hidden_layer_size, 
                                 early_stopping=0, 
                                 normalize=norm,
-                                num_of_classes=num_classes)
+                                num_of_classes=num_classes, 
+                                lambda_fair=lambda_fair)
         else:
             if use_NN:
                model =  NN_model(mode_problem=problem, batch_size=batch_size, max_epoch=max_epochs,
                                             lr=lr, validation_fraction=val_frac, optimizer='sgd', address=None, 
                                             hidden_layers=hidden_layer_size,
                                             num_of_classes=num_classes,
-                                            normalize=norm)
+                                            normalize=norm,
+                                            use_fairness=use_fairness,
+                                            fairness_attr=fairness_attr, 
+                                            num_of_fair=num_of_fair, 
+                                            lambda_fair=lambda_fair)
             else:
                 model = MLPClassifier(hidden_layer_sizes=hidden_layer_size,
                                     activation='relu',
