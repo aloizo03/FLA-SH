@@ -7,7 +7,7 @@ import random
 from hilbertcurve.hilbertcurve import HilbertCurve
 from sklearn.utils import shuffle
 
-
+import tempfile
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.cluster import DBSCAN
@@ -55,7 +55,8 @@ class Data_Shapley_Dataset:
                  label_class='class',
                  fairness_attr=0,
                  num_of_groups=2, 
-                 lambda_fair=1.0):
+                 lambda_fair=1.0, 
+                 use_embeds=False):
         
         self.datasets_path = datasets_path
         self.metric = metric
@@ -73,6 +74,7 @@ class Data_Shapley_Dataset:
         self.datasets_filenames = {}
         self.label_to_idx = {}
         self.use_img = False
+        self.use_embeds = use_embeds
         
         self.label_class = label_class
         self.use_fairness = use_fairness
@@ -113,8 +115,17 @@ class Data_Shapley_Dataset:
                 file_name = file_.split('/')[-1].split('.')[0].upper()
                 class_labels = df.loc[:, df.columns.str.startswith(class_label)]
                 X_lst = []
+                target_col = None
+                for col in ['file_path', 'file', 'filename']:
+                    if col in df.columns:
+                        target_col = col
+                        break
+                        
+                if target_col is None:
+                    raise KeyError("Dataframe must contain a column named 'file_path', 'file', or 'filename'")
+                
                 for idx, row in df.iterrows():
-                    X_lst.append(cv2.imread(row['file_path']))
+                    X_lst.append(cv2.imread(row[target_col]))
                 x_np = np.asarray(X_lst)
                 datasets_train_dict[file_name]['X'] = x_np
                 datasets_train_dict[file_name]['Y'] = class_labels
@@ -128,14 +139,30 @@ class Data_Shapley_Dataset:
         for data_name, df in df_dict.items():
             data_name = data_name.split('/')[-1].split('.')[0].upper()
             class_labels = df.loc[:, df.columns.str.startswith(class_label)]
-            if self.use_img:
+            if self.use_img and not self.use_embeds:
                 X_lst = []
+                target_col = None
+                for col in ['file_path', 'file', 'filename']:
+                    if col in df.columns:
+                        target_col = col
+                        break
+                        
+                if target_col is None:
+                    raise KeyError("Dataframe must contain a column named 'file_path', 'file', or 'filename'")
+                
                 for idx, row in df.iterrows():
-                    X_lst.append(cv2.imread(row['file_path']))
+                    X_lst.append(cv2.imread(row[target_col]))
                 x_np = np.asarray(X_lst)
                 out_dict[data_name]['X'] = x_np
             else:
+                target_col = None
+                for col in ['file_path', 'file', 'filename']:
+                    if col in df.columns:
+                        target_col = col
+                        break
                 row_tuples = df.drop(columns=list(class_labels.columns))
+                if self.use_embeds:
+                    row_tuples = df.drop(columns=[target_col, self.fairness_attr])
                 out_dict[data_name]['X'] = row_tuples
             out_dict[data_name]['Y'] = class_labels
 
@@ -180,19 +207,22 @@ class Data_Shapley_Dataset:
             tokenizer = BertTokenizer.from_pretrained(model_id)
             model = BertModel.from_pretrained(model_id, output_hidden_states=True).to(device)
 
+        target_col = None
+        for col in ['file_path', 'file', 'filename']:
+            if col in df.columns:
+                target_col = col
+                break
+                
+        if target_col is None:
+            raise KeyError("Dataframe must contain a column named 'file_path', 'file', or 'filename'")
+        
         if isinstance(data, dict):
             filenames = list(data.keys())
         elif isinstance(data, str):
             df = pd.read_csv(os.path.join(self.datasets_path, data))
-            try:
-                filenames = df['file_path'].tolist()
-            except: 
-                filenames = df['filename'].tolist()
+            filenames = df[target_col].tolist()
         elif isinstance(data, pd.DataFrame):
-            try:
-                filenames = data['file_path'].tolist()
-            except: 
-                filenames = data['filename'].tolist()
+            filenames = df[target_col].tolist()
 
         out_dict = {key: None for key in filenames}
         
@@ -230,37 +260,13 @@ class Data_Shapley_Dataset:
         out_df["class"] = class_lst
         return out_dict, out_df
 
-    # def convert_img_data_to_vectors(self, data, y_labels):
-    #     out_dict = {}
-    #     pipe = pipeline(task="image-feature-extraction", model_name="google/vit-base-patch16-224", pool=True, device='cuda', use_fast=True, )
-    #     if isinstance(data, dict):
-    #         filenames = list(data.keys())
-    #     elif isinstance(data, str):
-    #         df = pd.read_csv(os.path.join(self.datasets_path, data))
-    #         try:
-    #             filenames = df['file_path'].tolist()
-    #         except: 
-    #             filenames = df['filename'].tolist()
-    #     elif isinstance(data, pd.DataFrame):
-    #         try:
-    #             filenames = data['file_path'].tolist()
-    #         except: 
-    #             filenames = data['filename'].tolist()
-            
-            
-    #     outputs = pipe(filenames)
-    #     for embd, file_path in zip(outputs, filenames):
-    #         out_dict[file_path] = np.asarray(embd[0], dtype=np.float64)
-        
-    #     return out_dict
-
-    def convert_img_data_to_vectors(self, data, y_labels, fair_feat=None, allign_method='mean'):
+    def convert_img_data_to_vectors(self, data, y_labels, fair_feat=None, allign_method='mean', batch_size=64):
         out_dict = {}
         out_dict_image_ebds = {}
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
         model.eval()
 
         if isinstance(data, dict):
@@ -272,7 +278,6 @@ class Data_Shapley_Dataset:
             filenames = data.get('file_path', data.get('filename')).tolist()
         
         fair_texts = None
-        
         if self.use_fairness and fair_feat is not None:
             if isinstance(fair_feat, (pd.DataFrame, pd.Series)):
                 fair_vals = fair_feat.values.flatten()
@@ -280,70 +285,76 @@ class Data_Shapley_Dataset:
                 fair_vals = fair_feat.flatten()
             else:
                 fair_vals = list(fair_feat)
-            
-            if len(fair_vals) != len(filenames):
-                raise ValueError(f"fair_feat length ({len(fair_vals)}) must match data length ({len(filenames)})")
-                
             fair_texts = [str(feat) for feat in fair_vals]
+
+        num_samples = len(filenames)
+        all_fused = []
+        all_images = []
+
+        print(f"Processing {num_samples} images in batches of {batch_size}!!")
+
+        for i in range(0, num_samples, batch_size):
+            batch_files = filenames[i : i + batch_size]
+            
+            batch_labels = []
+            for f in batch_files:
+                val = self.idx_to_label[y_labels[f]]
+                if isinstance(val, (list, np.ndarray, pd.Series)):
+                    batch_labels.append(str(val[0]))
+                else:
+                    batch_labels.append(str(val))
+
+            batch_imgs = [Image.open(f).convert("RGB") for f in batch_files]
+
+            inputs = processor(
+                text=batch_labels,
+                images=batch_imgs,
+                return_tensors="pt",
+                padding=True
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+                img_emb = outputs.image_embeds 
+                txt_emb = outputs.text_embeds   
+
+                fair_emb = None
+                if fair_texts:
+                    batch_fair = fair_texts[i : i + batch_size]
+                    f_inputs = processor(text=batch_fair, return_tensors="pt", padding=True).to(device)
+                    fair_emb = model.get_text_features(**f_inputs)
+
+                if allign_method == 'mean':
+                    if fair_emb is not None:
+                        fused = (img_emb + txt_emb + fair_emb) / 3
+                    else:
+                        fused = (img_emb + txt_emb) / 2
+                elif allign_method == 'concat':
+                    if fair_emb is not None:
+                        fused = torch.cat([img_emb, txt_emb, fair_emb], dim=-1)
+                    else:
+                        fused = torch.cat([img_emb, txt_emb], dim=-1)
+
+                all_fused.append(fused.cpu())
+                all_images.append(img_emb.cpu())
+
+        all_fused = torch.cat(all_fused, dim=0).numpy().astype(np.float64)
+        all_images = torch.cat(all_images, dim=0).numpy().astype(np.float64)
         
-        
-        labels = [self.idx_to_label[y_labels[f]] for f in filenames]
-
-        images = [Image.open(filename).convert("RGB") for filename in filenames] 
-
-        inputs = processor(
-            text=labels,
-            images=images,
-            return_tensors="pt",
-            padding=True).to(device)
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-            image_embeddings = outputs.image_embeds # (N, D)
-            text_embeddings = outputs.text_embeds   # (N, D)
-
-            fair_embeddings = None
-            if fair_texts:
-                fair_inputs = processor(text=fair_texts, return_tensors="pt", padding=True).to(device)
-                fair_embeddings = model.get_text_features(**fair_inputs)
-
-        
-        if allign_method == 'mean':
-            if fair_embeddings is not None:
-                fused_embedding = (image_embeddings + text_embeddings + fair_embeddings) / 3
-            else:
-                fused_embedding = (image_embeddings + text_embeddings) / 2
-        
-        elif allign_method == 'concat':
-            if fair_embeddings is not None:
-                fused_embedding = torch.cat([image_embeddings, text_embeddings, fair_embeddings], dim=-1)
-            else:
-                fused_embedding = torch.cat([image_embeddings, text_embeddings], dim=-1)
-
-        fused_np = fused_embedding.cpu().numpy()
-        img_np = image_embeddings.cpu().numpy()
-
         for i, file_path in enumerate(filenames):
-            out_dict[file_path] = fused_np[i]
-            out_dict_image_ebds[file_path] = img_np[i]
+            safe_key = str(file_path)
+            out_dict[safe_key] = all_fused[i]
+            out_dict_image_ebds[safe_key] = all_images[i]
 
         return out_dict, out_dict_image_ebds
     
 
     def split_by_cluster(self, chunk_size, data_tuples_embds):
         num_of_clusters = np.int_(np.ceil(data_tuples_embds.shape[0] / chunk_size))
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.cluster import MiniBatchKMeans
-        data_tuples_embds = StandardScaler().fit_transform(data_tuples_embds)
 
-        if self.use_fairness:
-            clustering = MiniBatchKMeans(n_clusters=num_of_clusters, random_state=42, batch_size=chunk_size, n_init='auto')
-            initial_labels = clustering.fit_predict(data_tuples_embds)
-        else:
-            clustering = KMeans(n_clusters=num_of_clusters, random_state=42)
-            initial_labels = clustering.fit_predict(data_tuples_embds)
-        # clustering = KMeans(n_clusters=num_of_clusters, random_state=42)
-        # initial_labels = clustering.fit_predict(data_tuples_embds)
+        clustering = KMeans(n_clusters=num_of_clusters, random_state=42, algorithm="lloyd")
+        initial_labels = clustering.fit_predict(data_tuples_embds)
+
         chunks = {}
         cluster_id = 0
         for label in np.unique(initial_labels):
@@ -358,14 +369,9 @@ class Data_Shapley_Dataset:
                 if num_of_clusters <= 1:
                     num_of_clusters = 2
                 
-                if self.use_fairness:
-                    sub_clustering = MiniBatchKMeans(n_clusters=num_of_clusters, random_state=42)
-                    sub_labels = sub_clustering.fit_predict(cluster_data)
-                else:
-                    sub_clustering = KMeans(n_clusters=num_of_subclusters, random_state=label)
-                    sub_labels = sub_clustering.fit_predict(cluster_data)
-                # sub_clustering = KMeans(n_clusters=num_of_subclusters, random_state=label)
-                # sub_labels = sub_clustering.fit_predict(cluster_data)
+                sub_clustering = KMeans(n_clusters=num_of_subclusters, random_state=42, )
+                sub_labels = sub_clustering.fit_predict(cluster_data)
+
                 for sub_label in np.unique(sub_labels):
                     sub_indices = indices[sub_labels == sub_label]
                     chunks[cluster_id] = sub_indices
@@ -399,109 +405,107 @@ class Data_Shapley_Dataset:
 
 
     def split_by_tree(self, chunk_size, data_tuples_embds, use_query_r=False):
+        N = data_tuples_embds.shape[0]
+        
+        tree = KDTree(data_tuples_embds, leaf_size=40)
+        
+        visited = np.zeros(N, dtype=bool)
         chunks_idx = {}
-        idxs_ = [i for i in range(data_tuples_embds.shape[0])]
-        data_tuples_embds_tmp = data_tuples_embds
         chunk_id = 0
         
-        for i in range(data_tuples_embds.shape[0]):
-            flag = True
-            for idxs in chunks_idx.values():
-                if i in idxs:
-                    flag = False
+        for i in range(N):
+            if visited[i]:
+                continue
+            
+            query_tuple = data_tuples_embds[i:i+1]
+            candidates = []
+            
+            if use_query_r:
+                rad_ = 5
+                indxs = tree.query_radius(query_tuple, r=rad_)[0]
+                valid_mask = ~visited[indxs]
+                candidates = indxs[valid_mask]
+                if len(candidates) > chunk_size:
+                    candidates = candidates[:chunk_size]
+            else:
+                k_search = min(N, chunk_size * 2) 
+                dists, indxs = tree.query(query_tuple, k=k_search)
+                indxs = indxs[0] 
+                valid_mask = ~visited[indxs]
+                candidates = indxs[valid_mask]
+                if len(candidates) > chunk_size:
+                    candidates = candidates[:chunk_size]
 
-            if flag:
-                tree = KDTree(data_tuples_embds_tmp, leaf_size=6)
-                query_tuple = data_tuples_embds[i, :].reshape(-1, data_tuples_embds[i, :].shape[0])
-                if chunk_size <= len(idxs_):
-                    if use_query_r:
-                        rad_ = 5
-                        indxs = tree.query_radius(query_tuple, r=rad_)
-                        if len(indxs[0]) > chunk_size:
-                            indxs = indxs[:chunk_size]
-                    else:
-                        dist, indxs = tree.query(query_tuple, k=chunk_size)
-                else:
-                    chunks_idx[chunk_id] = idxs_
-                    return chunks_idx
+            if len(candidates) > 0:
+                chunks_idx[chunk_id] = candidates.tolist()
+                visited[candidates] = True
+                chunk_id += 1
                 
-                chunks_idx[chunk_id] = [idxs_[i] for i in indxs[0]]
-                data_tuples_embds_tmp = np.delete(data_tuples_embds_tmp, indxs[0], axis=0)
-                idxs_ = [j for i, j in enumerate(idxs_) if i not in indxs[0]]
 
-                chunk_id+=1
+        min_limit = 3
+        
+        orphans = []
+        ids_to_remove = []
+        point_to_chunk_map = {}
 
-        if use_query_r:
-            merge_small_chunks(data_tuples_embds, chunks_idx, chunk_size)
+        for cid, idxs in chunks_idx.items():
+            if len(idxs) < min_limit:
+                orphans.extend(idxs)
+                ids_to_remove.append(cid)
+            else:
+                for idx in idxs:
+                    point_to_chunk_map[idx] = cid
+
+        for cid in ids_to_remove:
+            del chunks_idx[cid]
+
+        for orphan_idx in orphans:
+            orphan_vec = data_tuples_embds[orphan_idx].reshape(1, -1)
+
+            dists, neighbor_idxs = tree.query(orphan_vec, k=min(N, 50))
+            neighbor_idxs = neighbor_idxs[0]
+            
+            merged = False
+            
+            for n_idx in neighbor_idxs:
+                if n_idx == orphan_idx: 
+                    continue 
+                
+                if n_idx in point_to_chunk_map:
+                    target_cid = point_to_chunk_map[n_idx]
+                    
+                    if len(chunks_idx[target_cid]) < chunk_size:
+                        chunks_idx[target_cid].append(orphan_idx)
+                        point_to_chunk_map[orphan_idx] = target_cid # Mark this point as valid now
+                        merged = True
+                        break
+
+            if not merged:
+                for n_idx in neighbor_idxs:
+                    if n_idx == orphan_idx: continue
+                    if n_idx in point_to_chunk_map:
+                        target_cid = point_to_chunk_map[n_idx]
+                        chunks_idx[target_cid].append(orphan_idx)
+                        point_to_chunk_map[orphan_idx] = target_cid
+                        merged = True
+                        break
+
         return chunks_idx
-    
-    # def split_by_tree(self, chunk_size, data_tuples_embds, use_query_r=False):
-    #     # 1. Build Tree
-    #     tree = KDTree(data_tuples_embds, leaf_size=30) 
-    #     n_samples = data_tuples_embds.shape[0]
-    #     visited = np.zeros(n_samples, dtype=bool) 
-    #     chunks_idx = {}
-    #     chunk_id = 0
+
         
-    #     for i in range(n_samples):
-    #         if visited[i]: continue
-                
-    #         query_tuple = data_tuples_embds[i, :].reshape(1, -1)
-            
-    #         # Determine neighbors
-    #         if use_query_r:
-    #             indxs = tree.query_radius(query_tuple, r=5.0)[0]
-    #             valid_indices = [idx for idx in indxs if not visited[idx]]
-    #             if len(valid_indices) > chunk_size:
-    #                 valid_indices = valid_indices[:chunk_size]
-    #         else:
-    #             indxs = tree.query(query_tuple, k=chunk_size, return_distance=False)[0]
-    #             valid_indices = [idx for idx in indxs if not visited[idx]]
-
-    #         # Create chunk (guaranteed to have at least 'i')
-    #         if len(valid_indices) > 0:
-    #             chunks_idx[chunk_id] = valid_indices
-    #             visited[valid_indices] = True
-    #             chunk_id += 1
-        
-    #     final_chunks = {}
-    #     final_id = 0
-    #     min_acceptable_size = int(chunk_size * 0.2) # e.g., size 2 if chunk_size is 10
-        
-    #     buffer_chunk = [] # temporarily holds data from tiny chunks
-
-    #     for cid in range(chunk_id):
-    #         current_data = chunks_idx[cid]
-            
-    #         if len(current_data) >= min_acceptable_size:
-    #             if len(buffer_chunk) > 0:
-    #                 current_data = buffer_chunk + current_data
-    #                 buffer_chunk = []
-                
-    #             final_chunks[final_id] = current_data
-    #             final_id += 1
-    #         else:
-    #             buffer_chunk.extend(current_data)
-                
-    #             if len(buffer_chunk) >= min_acceptable_size:
-    #                 final_chunks[final_id] = buffer_chunk
-    #                 final_id += 1
-    #                 buffer_chunk = []
-
-    #     if len(buffer_chunk) > 0:
-    #         if final_id > 0:
-    #             final_chunks[final_id - 1].extend(buffer_chunk)
-    #         else:
-    #             print('HERE THE ERROR')
-    #             final_chunks[0] = buffer_chunk
-
-    #     return final_chunks
-
-
     def update_img_fullpath(self, df):
         head_path, tail = os.path.split(self.datasets_path)
-        for index, row in df.iterrows():
-            df.at[index, 'file_path'] = os.path.normpath(os.path.join(head_path, row['file_path']))
+
+        target_col = None
+        for col in ['file_path', 'file', 'filename']:
+            if col in df.columns:
+                target_col = col
+                break
+                
+        if target_col is None:
+            raise KeyError("Dataframe must contain a column named 'file_path', 'file', or 'filename'")
+        
+        df[target_col] = df[target_col].apply(lambda x: os.path.normpath(os.path.join(head_path, str(x))))
 
         return df
     
@@ -515,14 +519,19 @@ class Data_Shapley_Dataset:
         class_labels = df.loc[:, df.columns.str.startswith(class_label)]
         
         class_unique = class_labels.drop_duplicates()[class_label].tolist()
+        
         if idx_to_label is None:
             self.label_to_idx = {label: i for i, label in enumerate(class_unique)}
             self.idx_to_label = {i: label for label, i in self.label_to_idx.items()}
-            self.num_of_classes = len(class_unique)
+        elif len(idx_to_label) == 0:
+            self.label_to_idx = {label: i for i, label in enumerate(class_unique)}
+            self.idx_to_label = {i: label for label, i in self.label_to_idx.items()}
         else:
             self.idx_to_label = idx_to_label
             self.label_to_idx = {label: i for i, label in self.idx_to_label.items()}
-            self.num_of_classes = len(class_unique)
+
+        self.num_of_classes = len(class_unique)
+
 
     def get_fair_attrbs_(self, df_):
         if all(isinstance(i, int) for i in self.fairness_attr):
@@ -568,11 +577,17 @@ class Data_Shapley_Dataset:
                 file_name = self.datasets_path.split('/')[-1].split('.')[0].upper()
                 self.calculate_num_of_classes(df=df_img_info, class_label=self.label_class)
 
+                target_col = None
+                for col in ['file_path', 'file', 'filename']:
+                    if col in df_img_info.columns:
+                        target_col = col
+                        break
                 
                 if convert_labels:
                     self.labels_to_idx(df=df_img_info, idx_to_label=idx_to_label, class_label=self.label_class)
                     print('Label to idx:')
                     print(self.label_to_idx)
+                    print(self.idx_to_label)
                     print('-----------')
                     df_img_info[self.label_class] = df_img_info[self.label_class].map(self.label_to_idx)
                 
@@ -581,36 +596,70 @@ class Data_Shapley_Dataset:
                 
                 fair_attrbs_groups = None
                 if self.use_fairness:
-                    fair_attrbs_raw_txt = self.get_fair_attrbs_(df_=df_file,)
-                    fair_attrbs_groups = self.create_group_labels(df_=df_file, task_label_col=self.label_class)
-                    print(fair_attrbs_groups)
+                    fair_attrbs_raw_txt = self.get_fair_attrbs_(df_=df_img_info,)
+                    fair_attrbs_groups = self.create_group_labels(df_=df_img_info, task_label_col=self.label_class)
                     self.num_of_groups = np.unique(fair_attrbs_groups).shape[0]
                 
                 X_embds_ret=None
-                Y_labels = {row['file_path']: row["class"] for index, row in df_img_info.iterrows()}
+                Y_labels = {row[target_col]: row[self.label_class] for index, row in df_img_info.iterrows()}
                 if split_by == 'ordered':
                     df_chunks = np.array_split(df_img_info, chunk_size)
                     if self.use_fairness:
                         df_fairs_ret = np.array_split(fair_attrbs_groups, chunk_size)
+                    
                 elif split_by.lower() == 'tree':
-                    img_data = {row['file_path']: cv2.imread(row['file_path']) for index, row in df_img_info.iterrows()}
-                    X_embds, X_embeds_img = self.convert_img_data_to_vectors(data=img_data, Y_labels=Y_labels, fair_feat=fair_attrbs_raw_txt)
+                    img_data = {row[target_col]: cv2.imread(row[target_col]) for index, row in df_img_info.iterrows()}
+                    X_embds, X_embeds_img = self.convert_img_data_to_vectors(data=img_data, y_labels=Y_labels, fair_feat=fair_attrbs_raw_txt)
+                    
                     X_embds = [embds for path_, embds in X_embds.items()]
                     X_embds = np.asarray(X_embds, dtype=np.float64)
                     chunk_idxs = self.split_by_tree(data_tuples_embds=X_embds, chunk_size=chunk_size)
+                    X_embeds_img = [embds for path_, embds in X_embeds_img.items()]
+                    X_embeds_img = np.asarray(X_embeds_img, dtype=np.float64)
                     if self.use_fairness:
                         df_fairs_ret = [fair_attrbs_groups.iloc[idxs] for idxs in chunk_idxs.values()]
-                    df_chunks = [df_img_info.iloc[idxs] for idxs in chunk_idxs.values()]
+                    if self.use_embeds:
+                        columns = [f"X_{i+1}" for i in range(len(X_embeds_img[0]))]
+                        # Build dataframe
+                        df_embeds = pd.DataFrame(X_embeds_img, columns=columns)
+
+                        # Add class column
+                        df_embeds[self.label_class] = df_img_info[self.label_class].to_list()
+                        df_embeds[target_col] = df_img_info[target_col].to_list()
+                        if self.use_fairness:
+                            df_embeds[self.fairness_attr] = fair_attrbs_raw_txt
+                        df_chunks = [df_embeds.iloc[idxs] for idxs in chunk_idxs.values()]
+                    else:
+                        df_chunks = [df_img_info.iloc[idxs] for idxs in chunk_idxs.values()]
                     X_embds_ret = [X_embeds_img[idxs] for idxs in chunk_idxs.values()]
                 elif split_by.lower() == 'cluster':
-                    img_data = {row['file_path']: cv2.imread(row['file_path']) for index, row in df_img_info.iterrows()}
-                    X_embds, X_embeds_img = self.convert_img_data_to_vectors(data=img_data, Y_labels=Y_labels, fair_feat=fair_attrbs_raw_txt)
+                    img_data = {row[target_col]: cv2.imread(row[target_col]) for index, row in df_img_info.iterrows()}
+                    X_embds, X_embeds_img = self.convert_img_data_to_vectors(data=img_data, y_labels=Y_labels, fair_feat=fair_attrbs_raw_txt)
+                    print('Finish embedding with CLIP')
                     X_embds = [embds for path_, embds in X_embds.items()]
                     X_embds = np.asarray(X_embds, dtype=np.float64)
+                    print('Start K-Means Clustering')
                     chunk_idxs = self.split_by_cluster(chunk_size=chunk_size, data_tuples_embds=X_embds)
+                    print('Finished K-Means Clustering')
+                    X_embeds_img = [embds for path_, embds in X_embeds_img.items()]
+                    X_embeds_img = np.asarray(X_embeds_img, dtype=np.float64)
                     if self.use_fairness:
                         df_fairs_ret = [fair_attrbs_groups.iloc[idxs] for idxs in chunk_idxs.values()]
-                    df_chunks = [df_img_info.iloc[idxs] for idxs in chunk_idxs.values()]
+
+                    if self.use_embeds:
+                        columns = [f"X_{i+1}" for i in range(len(X_embeds_img[0]))]
+                        # Build dataframe
+                        df_embeds = pd.DataFrame(X_embeds_img, columns=columns)
+
+                        # Add class column
+                        df_embeds[self.label_class] = df_img_info[self.label_class].to_list()
+                        df_embeds[target_col] = df_img_info[target_col].to_list()
+                        if self.use_fairness:
+                            df_embeds[self.fairness_attr] = fair_attrbs_raw_txt
+                        df_chunks = [df_embeds.iloc[idxs] for idxs in chunk_idxs.values()]
+                    else:
+                        df_chunks = [df_img_info.iloc[idxs] for idxs in chunk_idxs.values()]
+                    
                     X_embds_ret = [X_embeds_img[idxs] for idxs in chunk_idxs.values()]
 
                 file_dict = {f'{file_name}_{i}.csv': df_ for i, df_ in enumerate(df_chunks)}
@@ -799,10 +848,16 @@ class Data_Shapley_Dataset:
         else:
             use_norm = True
 
-        self.model = create_model(model_type=self.model_type,problem=self.problem, max_epochs=max_epochs, 
-                                  batch_size=batch_size, lr=lr, val_frac=val_frac, hidden_layer_size=self.hidden_layers, 
-                                  use_img=use_img, use_NN=use_NN, num_classes=self.num_of_classes, norm=use_norm, use_fairness=self.use_fairness, 
-                                  fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups, lambda_fair=self.lambda_fair)
+        if self.use_embeds and self.use_img:
+            self.model = create_model(model_type=self.model_type,problem=self.problem, max_epochs=max_epochs, 
+                                    batch_size=batch_size, lr=lr, val_frac=val_frac, hidden_layer_size=self.hidden_layers, 
+                                    use_img=False, use_NN=use_NN, num_classes=self.num_of_classes, norm=use_norm, use_fairness=self.use_fairness, 
+                                    fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups, lambda_fair=self.lambda_fair)
+        else:
+            self.model = create_model(model_type=self.model_type,problem=self.problem, max_epochs=max_epochs, 
+                                    batch_size=batch_size, lr=lr, val_frac=val_frac, hidden_layer_size=self.hidden_layers, 
+                                    use_img=use_img, use_NN=use_NN, num_classes=self.num_of_classes, norm=use_norm, use_fairness=self.use_fairness, 
+                                    fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups, lambda_fair=self.lambda_fair)
         if use_img:
             self.model.fit(X, y.values.ravel(), X_val=None, y_val=False, use_val=False, fair_attrbs=fair_attr_df)
             X_torch = transform_to_torch(X).to(self.model.device)
@@ -979,67 +1034,75 @@ class Data_Shapley_Dataset:
             return Shap_values_dict, dataset_avg
 
     def subset_selection(self, data_dict, data_X, data_y, data_fair, subsets, lr, total_subset, th,  metrics, data_type, show_subsets=False, val_frac=0.1, use_gradient=True, use_norm=True, fair_attrbs=None):
-        data_flags = {key: True for key in data_dict.keys()}
-        data_count = {key: 0 for key in data_dict.keys()}
-
+        data_values = list(data_dict.values())
         data_dict_keys_lst = list(data_dict.keys())
+        data_flags = {key: True for key in data_dict_keys_lst}
+        data_count = {key: 0 for key in data_dict_keys_lst}
 
         allowed_perc = np.ceil(total_subset * 0.25)
         priority_counter = 5
-        # For each subset check if we are sattisfied it or we continue with a new one
 
-        
-        for idx in range(len(subsets)):
+        # Pre-define comparator
+        if self.problem == 'regression':
+            eq_ = lambda a, b: a > b 
+        else:
+            eq_ = lambda a, b: a < b 
+
+        for idx in tqdm(range(len(subsets))):
+
             flag = False
-            # check if in a chunk a data point is more than the allowed percentage to be in a subset
             for chunk_id in subsets[idx]:
+                # Using the pre-computed keys list
                 if data_count[data_dict_keys_lst[chunk_id]] >= allowed_perc:
                     flag = True
+                    break 
 
             attempts = 0
-            if self.problem == 'regression':
-                eq_ = lambda a, b: a > b 
-            else:
-                eq_ = lambda a, b: a < b 
-
+            
             while (eq_(metrics[idx], th) or flag):
-                # if repeat more than 5 times for a subset with index idx exit (to not get in infinitive loop)
-                if attempts >= 5:
+                if attempts >= 2:
                     break
 
                 attempts += 1
-                # Select a new subset and we guide to select only in the first palces which is the most probably high quality chunks
-                if idx == len(data_dict_keys_lst):
-                    new_subset = list(set(random.sample(range(idx-2), random.randint(0, idx-2))))
-                    while len(new_subset) == 0:
-                        new_subset = list(set(random.sample(range(idx-2), random.randint(0, idx-2))))
-                else:
-                    new_subset = list(set(random.sample(range(idx+2), random.randint(0, idx+2))))
-                    while len(new_subset) == 0:
-                        new_subset = list(set(random.sample(range(idx+2), random.randint(0, idx+2))))
                 
-                for j, chunk_id in enumerate(new_subset):
-                    data_keys = data_dict_keys_lst[chunk_id]
-                    
-                    # check the remain valid canditates chunks where sattisfied the allowed percentage to be in a chunk
-                    valid_candidates = [i for i, k in enumerate(data_dict_keys_lst) if data_count[k] < allowed_perc]
-                    if len(valid_candidates) <= 1:
-                        break
-                    if data_count[data_keys] >= allowed_perc:
-                        if len(valid_candidates) == 0:
-                            new_subset[j] = random.randint(0, idx+priority_counter)
-                        else:
-                            new_subset[j] = random.choice(valid_candidates)
+                
+                range_limit = idx - 2 if idx == len(data_dict_keys_lst) else idx + 2
+                range_limit = max(1, range_limit) 
+
+                sample_size = random.randint(0, range_limit)
+                new_subset = list(set(random.sample(range(range_limit), sample_size)))
+                
+                # Retry logic if empty
+                while len(new_subset) == 0:
+                    sample_size = random.randint(0, range_limit)
+                    new_subset = list(set(random.sample(range(range_limit), sample_size)))
+                
+                
+                valid_candidates = [i for i, k in enumerate(data_dict_keys_lst) if data_count[k] < allowed_perc]
+                valid_candidates_len = len(valid_candidates)
+
+                if valid_candidates_len <= 1:
+                    pass 
+                else:
+                    for j, chunk_id in enumerate(new_subset):
+                        data_key = data_dict_keys_lst[chunk_id]
+                        
+                        if data_count[data_key] >= allowed_perc:
+                            if valid_candidates_len == 0:
+                                new_subset[j] = random.randint(0, idx + priority_counter)
+                            else:
+                                new_subset[j] = random.choice(valid_candidates)
 
                 flag = False
-
                 new_subset = set(new_subset)
                 subsets[idx] = new_subset
-                X = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if j in new_subset]
-                y = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if j in new_subset]
+
+                X = [data_values[j]['X'] for j in new_subset]
+                y = [data_values[j]['Y'] for j in new_subset]
 
                 if self.use_fairness:
-                    fair_attrb_ = [fair_data for j, fair_data in enumerate(fair_attrbs) if j in new_subset]
+
+                    fair_attrb_ = [fair_attrbs[j] for j in new_subset]
 
                 if use_gradient:
                     if all(isinstance(item, pd.DataFrame) for item in X):
@@ -1048,6 +1111,7 @@ class Data_Shapley_Dataset:
                     elif all(isinstance(item, np.ndarray) for item in X):
                         X = np.concatenate(X, axis=0)
                         y = np.concatenate(y, axis=0)
+                                        
                     if self.use_fairness:
                         if all(isinstance(item, (pd.DataFrame, pd.Series)) for item in fair_attrb_):
                             fair_attrb_ = pd.concat(fair_attrb_, axis=0)
@@ -1059,39 +1123,58 @@ class Data_Shapley_Dataset:
                     data_X[idx] = X
                     data_y[idx] = y
                     
-                    if len(X) * val_frac < 2:
-                        val_fracs = np.arange(0.01, val_frac, 0.01, dtype=np.float64)
-                        for frac in val_fracs:
-                            if len(X) * val_frac > 2:
-                                val_frac = frac
+                    current_len = len(X)
+                    if current_len * val_frac < 2:
+                        required_frac = 2.0 / current_len
+                        val_frac = np.ceil(required_frac * 100) / 100
                     
-                    model = create_model(model_type=self.model_type, 
-                                 problem=self.problem,
-                                 max_epochs=1,
-                                 batch_size=1, 
-                                 lr=lr, 
-                                 val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img, 
-                                 use_NN=True,
-                                 num_classes=self.num_of_classes, 
-                                 norm=use_norm,
-                                 use_fairness=self.use_fairness,
-                                 fairness_attr=self.fairness_attr,
-                                 num_of_fair=self.num_of_groups, 
-                                 lambda_fair=self.lambda_fair)
+                    if self.use_embeds and self.use_img:
+                        model = create_model(model_type=self.model_type, 
+                                        problem=self.problem,
+                                        max_epochs=1,
+                                        batch_size=1, 
+                                        lr=lr, 
+                                        val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=False, 
+                                        use_NN=True,
+                                        num_classes=self.num_of_classes, 
+                                        norm=use_norm,
+                                        use_fairness=self.use_fairness,
+                                        fairness_attr=self.fairness_attr,
+                                        num_of_fair=self.num_of_groups, 
+                                        lambda_fair=self.lambda_fair)
+
+                    else:
+                        model = create_model(model_type=self.model_type, 
+                                        problem=self.problem,
+                                        max_epochs=1,
+                                        batch_size=1, 
+                                        lr=lr, 
+                                        val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img, 
+                                        use_NN=True,
+                                        num_classes=self.num_of_classes, 
+                                        norm=use_norm,
+                                        use_fairness=self.use_fairness,
+                                        fairness_attr=self.fairness_attr,
+                                        num_of_fair=self.num_of_groups, 
+                                        lambda_fair=self.lambda_fair)
+                    
                     model.fit(X=data_X, y=data_y, X_val=None, y_val=None, fair_attrbs=data_fair, fair_attrbs_val=None, data_dict=None, batch_size=1, epochs=1, metric=self.metric)
                     new_metric = model.history['metrics'][idx] 
                 else:
-                    new_metric = self.get_score(X=X, y=y, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type)
+                    if self.use_img and self.use_embeds:
+                        new_metric = self.get_score(X=X, y=y, use_img=False, use_NN=False, lr=lr, max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type)
+                    else:
+                        new_metric = self.get_score(X=X, y=y, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type)
                 
-                # if the new chunk has better inidvidual contribution we update it
                 if eq_(metrics[idx], new_metric):
                     subsets[idx] = new_subset
                     metrics[idx] = new_metric
 
             for chunk_id in subsets[idx]:
-                data_count[data_dict_keys_lst[chunk_id]] += 1
-                if data_count[data_dict_keys_lst[chunk_id]] > allowed_perc:
-                    data_flags[data_dict_keys_lst[chunk_id]] = False
+                key = data_dict_keys_lst[chunk_id]
+                data_count[key] += 1
+                if data_count[key] > allowed_perc:
+                    data_flags[key] = False
                     priority_counter += 1
                     if priority_counter >= len(data_count):
                         priority_counter = len(data_count) - 1
@@ -1207,7 +1290,7 @@ class Data_Shapley_Dataset:
             for i, (key, values) in enumerate(data_dict.items()):
                 key_to_original_idx[key] = i
                 random_indices = random.sample(range(values['X'].shape[0]), np.ceil(values['X'].shape[0]*SR).astype(np.int_))
-                fair_attrbs = fair_attr_df[i]
+                
                 if isinstance(values['X'], pd.DataFrame):
                     X_ = values['X'].iloc[random_indices]
                 else:
@@ -1218,14 +1301,20 @@ class Data_Shapley_Dataset:
                 else:
                     y_ =  values['Y'][random_indices]
 
-                if isinstance(fair_attrbs, (pd.DataFrame, pd.Series)):
-                    sensitive_fair_attrbs = fair_attrbs.iloc[random_indices]
-                elif isinstance(fair_attrbs, np.ndarray):
-                    sensitive_fair_attrbs = fair_attrbs[random_indices]
+                sensitive_fair_attrbs = None
+                if self.use_fairness:
+                    fair_attrbs = fair_attr_df[i]
+                    if isinstance(fair_attrbs, (pd.DataFrame, pd.Series)):
+                        sensitive_fair_attrbs = fair_attrbs.iloc[random_indices]
+                    elif isinstance(fair_attrbs, np.ndarray):
+                        sensitive_fair_attrbs = fair_attrbs[random_indices]
+                    else:
+                        sensitive_fair_attrbs = [fair_attrbs[i] for i in random_indices]
+                if self.use_embeds and self.use_img:
+                    # Because we are using embeddings we use NN instead of CNN
+                    score_ = self.get_score(X=X_, y=y_, use_img=False, use_NN=True, lr=lr, max_epochs=10, batch_size=1, val_frac=val_frac, data_type=data_type, fair_attr_df=sensitive_fair_attrbs) 
                 else:
-                    sensitive_fair_attrbs = [fair_attrbs[i] for i in random_indices]
-
-                score_ = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=True, lr=lr, max_epochs=10, batch_size=1, val_frac=val_frac, data_type=data_type, fair_attr_df=sensitive_fair_attrbs) 
+                    score_ = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=True, lr=lr, max_epochs=10, batch_size=1, val_frac=val_frac, data_type=data_type, fair_attr_df=sensitive_fair_attrbs) 
                 scores_tmp[key] = score_
             # Sort the data by their individual contribution
             scores_tmp = dict(sorted(scores_tmp.items(), key=lambda item: item[1], reverse=True))
@@ -1284,23 +1373,42 @@ class Data_Shapley_Dataset:
                     metrics.append(0)
                 else:
                     # Make it to access the fairness
-                    metrics.append(self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type))
+                    if self.use_embeds and self.use_img:
+                        metrics.append(self.get_score(X=X_, y=y_, use_img=False, use_NN=False, lr=lr, max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type))
+                    else:
+                        metrics.append(self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type))
 
             if use_gradient:
 
-                model = create_model(model_type=self.model_type, 
-                                         problem=self.problem,
-                                         max_epochs=1,
-                                         batch_size=1, 
-                                         lr=lr, 
-                                         val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img, 
-                                         use_NN=True,
-                                         num_classes=self.num_of_classes,
-                                         norm=use_norm, 
-                                         use_fairness=self.use_fairness, 
-                                         fairness_attr=self.fairness_attr,
-                                         num_of_fair=self.num_of_groups, 
-                                         lambda_fair=self.lambda_fair)
+                if self.use_embeds and self.use_img:
+                    model = create_model(model_type=self.model_type, 
+                                        problem=self.problem,
+                                        max_epochs=1,
+                                        batch_size=1, 
+                                        lr=lr, 
+                                        val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=False, 
+                                        use_NN=True,
+                                        num_classes=self.num_of_classes, 
+                                        norm=use_norm,
+                                        use_fairness=self.use_fairness,
+                                        fairness_attr=self.fairness_attr,
+                                        num_of_fair=self.num_of_groups, 
+                                        lambda_fair=self.lambda_fair)
+
+                else:
+                    model = create_model(model_type=self.model_type, 
+                                        problem=self.problem,
+                                        max_epochs=1,
+                                        batch_size=1, 
+                                        lr=lr, 
+                                        val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img, 
+                                        use_NN=True,
+                                        num_classes=self.num_of_classes, 
+                                        norm=use_norm,
+                                        use_fairness=self.use_fairness,
+                                        fairness_attr=self.fairness_attr,
+                                        num_of_fair=self.num_of_groups, 
+                                        lambda_fair=self.lambda_fair)
                 model.fit(X=data_X, y=data_y, X_val=None, y_val=None, fair_attrbs=data_fair, data_dict=None, batch_size=1, epochs=1, metric=self.metric)
 
                 for i, index in enumerate(model.history['idxs']):
@@ -1318,20 +1426,34 @@ class Data_Shapley_Dataset:
                             subset_names.append(data_name)
             
             marginal_contrib = np.zeros((n, total_subset))
-
-            model = create_model(model_type=self.model_type, 
-                                         problem=self.problem,
-                                         max_epochs=1,
-                                         batch_size=1, 
-                                         lr=lr, 
-                                         val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img, 
-                                         use_NN=True,
-                                         num_classes=self.num_of_classes,
-                                         norm=use_norm,
-                                         use_fairness=self.use_fairness,
-                                         fairness_attr=self.fairness_attr,
-                                         num_of_fair=self.num_of_groups, 
-                                         lambda_fair=self.lambda_fair)
+            if self.use_embeds and self.use_img:
+                model = create_model(model_type=self.model_type, 
+                                            problem=self.problem,
+                                            max_epochs=1,
+                                            batch_size=1, 
+                                            lr=lr, 
+                                            val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=False, 
+                                            use_NN=True,
+                                            num_classes=self.num_of_classes,
+                                            norm=use_norm,
+                                            use_fairness=self.use_fairness,
+                                            fairness_attr=self.fairness_attr,
+                                            num_of_fair=self.num_of_groups, 
+                                            lambda_fair=self.lambda_fair)
+            else:
+                model = create_model(model_type=self.model_type, 
+                                            problem=self.problem,
+                                            max_epochs=1,
+                                            batch_size=1, 
+                                            lr=lr, 
+                                            val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img, 
+                                            use_NN=True,
+                                            num_classes=self.num_of_classes,
+                                            norm=use_norm,
+                                            use_fairness=self.use_fairness,
+                                            fairness_attr=self.fairness_attr,
+                                            num_of_fair=self.num_of_groups, 
+                                            lambda_fair=self.lambda_fair)
             for i in tqdm(range(n)):
                 for j, subset in enumerate(subsets):
                     if i in subset or len(subset) == 0:
@@ -1362,7 +1484,10 @@ class Data_Shapley_Dataset:
                         model.fit(X=X, y=y, X_val=None, y_val=None, fair_attrbs=fair_attrb_, fair_attrbs_val=None, data_dict=None, batch_size=1, epochs=1, metric=self.metric)
                         perf_with_i = model.history['metrics'][-1]
                     else:
-                        perf_with_i = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=100, batch_size=1, val_frac=0.1, data_type=data_type)
+                        if self.use_img and self.use_embeds:
+                            perf_with_i = self.get_score(X=X_, y=y_, use_img=False, use_NN=False, lr=lr, max_epochs=100, batch_size=1, val_frac=0.1, data_type=data_type)
+                        else:
+                            perf_with_i = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=100, batch_size=1, val_frac=0.1, data_type=data_type)
 
                     # For each data point find the Shapley value among all the available subsets
                     weight = self.C / (n * (len(subset) + 1))
