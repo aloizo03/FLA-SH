@@ -44,3 +44,23 @@ Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, 
 #### Permutation Options
 - `hilbert_kernel=False` → unified ratio sampling permutation
 - `hilbert_kernel=True` → Hilbert kernel permutation
+
+### Run Fair-Flash example
+
+```
+DS = Data_Shapley_Dataset(datasets_path='/path/to/csv/dir/',
+                          outpath='Output/results/',
+                          metric='Accuracy',
+                          problem='classification',
+                          model_type='MLP_Class',
+                          use_fairness=True, 
+                          fairness_attr='gender',
+                          lambda_fair=1.0)
+
+Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, chunk_size=256, split_by='cluster', data_type='tabular', k=50, use_hilbert_kernel=False, )
+```
+#### Fairness settings
+- `use_fairness=True` -> Enable the fairness on the SHapley calculation
+- `fairness_attr='gender'` -> Declaring the dataset column where we want to examine fairness on subpopulation groups
+- `lambda_fair=1.0` -> Declare the weight on fairness loss in total shapley contribution with range [0, 1]
+
