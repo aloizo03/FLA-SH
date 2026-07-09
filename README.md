@@ -1,4 +1,4 @@
-# FLA-SH: Fast, Heterogeneous Dataset QuaLity Assessment via SHapley Values
+# FLA-SH: Fast, Dataset QuaLity and Fairness Assessment via SHapley Values
 A Chunked Data Shapley approximation where estimates Shapley values per chunk by implementing a chunk partitioning and a sampling permutation we prioritise to select the most probably high quality chunks during the subset selection.
 
 ### Dependencies:
