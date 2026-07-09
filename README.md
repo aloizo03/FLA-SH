@@ -38,6 +38,7 @@ Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, 
 
 #### `data_type`
 - `image`
+- `tabular`
 - `text`
 - `vectors` (when vector embeddings are provided)
 
