@@ -150,10 +150,8 @@ class Data_Shapley_Dataset:
             AssertionError(f'Filepath {self.datasets_path} did not exists!!')
 
     def prepare_chunks(self, df_dict, class_label="class"):
-        out_dict = {
-            data_name.split('/')[-1].split('.')[0].upper(): {'X': None, 'Y': None}
-            for data_name, _ in df_dict.items()
-        }
+        out_dict = {data_name.split('/')[-1].split('.')[0].upper(): {'X': None, 'Y': None} for data_name, _ in
+                    df_dict.items()}
 
         for data_name, df in df_dict.items():
             data_name = data_name.split('/')[-1].split('.')[0].upper()
@@ -161,9 +159,7 @@ class Data_Shapley_Dataset:
 
             if self.use_img and not self.use_embeds:
                 X_lst = []
-                target_col = next(
-                    (c for c in ['file_path', 'filepath', 'file', 'filename']
-                     if c in df.columns), None)
+                target_col = next((c for c in ['file_path', 'filepath', 'file', 'filename'] if c in df.columns), None)
                 if target_col is None:
                     raise KeyError(
                         "Image DataFrame must contain a file path column "
@@ -234,10 +230,7 @@ class Data_Shapley_Dataset:
             filenames = list(data.keys())
             class_lst = [None] * len(filenames)
         elif isinstance(data, str):
-            # Must be a real CSV path
-            csv_path = (data if os.path.isabs(data)
-                        else os.path.join(os.path.dirname(
-                os.path.abspath(self.datasets_path)), data))
+            csv_path = (data if os.path.isabs(data) else os.path.join(os.path.dirname(os.path.abspath(self.datasets_path)), data))
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(
                     f"convert_text_data_to_vectors received '{data}' which does not resolve to an existing file. Pass a DataFrame instead.")
@@ -424,12 +417,7 @@ class Data_Shapley_Dataset:
 
             batch_imgs = [Image.open(f).convert("RGB") for f in batch_files]
 
-            inputs = processor(
-                text=batch_labels,
-                images=batch_imgs,
-                return_tensors="pt",
-                padding=True
-            ).to(device)
+            inputs = processor(text=batch_labels, images=batch_imgs, return_tensors="pt", padding=True).to(device)
 
             with torch.no_grad():
                 outputs = model(**inputs)
@@ -506,7 +494,7 @@ class Data_Shapley_Dataset:
 
             candidate_clusters = {cid: idxs for cid, idxs in chunks.items() if cid != singleton_cid}
 
-            if not candidate_clusters:
+            if not candidate_clusters:  # Edge case: no other clusters exist
                 break
 
             centroids = np.array([data_tuples_embds[idxs].mean(axis=0) for idxs in candidate_clusters.values()])
@@ -678,6 +666,7 @@ class Data_Shapley_Dataset:
     def update_img_fullpath(self, df):
 
         target_col = next((c for c in ['file_path', 'filepath', 'file', 'filename'] if c in df.columns), None)
+
         if target_col is None:
             raise KeyError("DataFrame must contain a file path column ('file_path', 'filepath', 'file', or 'filename')")
 
@@ -686,28 +675,51 @@ class Data_Shapley_Dataset:
         grandparent = os.path.dirname(parent_dir)
 
         missing_count = 0
+        hint = None
 
         def resolve(path_value):
-            nonlocal missing_count
+            nonlocal missing_count, hint
             raw = str(path_value).strip()
+
             if os.path.isabs(raw) and os.path.exists(raw):
                 return raw
+
+            if os.path.isabs(raw):
+                parts = [p for p in raw.split(os.sep) if p]
+                if hint is not None:
+                    start, base = hint
+                    if start < len(parts):
+                        c = os.path.normpath(os.path.join(base, *parts[start:]))
+                        if os.path.exists(c):
+                            return c
+                for start in range(1, len(parts)):
+                    for base in (datasets_dir, parent_dir, grandparent):
+                        c = os.path.normpath(os.path.join(base, *parts[start:]))
+                        if os.path.exists(c):
+                            hint = (start, base)
+                            return c
+
             c = os.path.normpath(os.path.join(datasets_dir, raw))
             if os.path.exists(c):
                 return c
+
             c = os.path.normpath(os.path.join(parent_dir, raw))
             if os.path.exists(c):
                 return c
+
             c = os.path.normpath(os.path.join(grandparent, raw))
             if os.path.exists(c):
                 return c
+
             basename = os.path.basename(raw)
             c = os.path.join(datasets_dir, basename)
             if os.path.exists(c):
                 return c
+
             c = os.path.join(parent_dir, basename)
             if os.path.exists(c):
                 return c
+
             missing_count += 1
             return os.path.normpath(os.path.join(datasets_dir, raw))
 
@@ -760,7 +772,6 @@ class Data_Shapley_Dataset:
 
         attr_names = [task_label_col] + list(sensitive_df.columns)
 
-        # data_arrays = [y] + [sensitive_df[col].values for col in sensitive_df.columns]
         combined = df_[attr_names].astype(str).agg(', '.join, axis=1)
         unique_combinations = sorted(combined.unique())
 
@@ -795,7 +806,15 @@ class Data_Shapley_Dataset:
 
                 if convert_labels:
                     self.labels_to_idx(df=df_img_info, idx_to_label=idx_to_label, class_label=self.label_class)
-                    df_img_info[self.label_class] = df_img_info[self.label_class].map(self.label_to_idx)
+                    col = df_img_info[self.label_class]
+                    mapped = col.map(self.label_to_idx)
+                    mapped = mapped.fillna(col.where(col.isin(list(self.idx_to_label.keys()))))
+                    if mapped.isna().any():
+                        bad = col[mapped.isna()].unique()[:10]
+                        raise ValueError(
+                            f"'{self.label_class}' values not found in label_to_idx "
+                            f"({list(self.label_to_idx.keys())[:10]}...): {list(bad)}")
+                    df_img_info[self.label_class] = mapped
 
                 if idx_to_label is not None:
                     self.labels_to_idx(df=df_img_info, idx_to_label=idx_to_label, class_label=self.label_class)
@@ -818,6 +837,15 @@ class Data_Shapley_Dataset:
                         df_fairs_ret = self.split_pandas_ordered(fair_attrbs_groups, chunk_size)
 
                     print(f'Finish splitting by ordered in {time.time() - start_time:.2f} seconds')
+
+                elif split_by.lower() == 'random':
+                    start_time = time.time()
+                    perm = np.random.permutation(len(df_img_info))
+                    perm_chunks = np.array_split(perm, chunk_size)
+                    df_chunks = [df_img_info.iloc[idxs].copy() for idxs in perm_chunks]
+                    if self.use_fairness:
+                        df_fairs_ret = [fair_attrbs_groups.iloc[idxs] for idxs in perm_chunks]
+                    print(f'Finish splitting by random in {time.time() - start_time:.2f} seconds')
 
                 elif split_by.lower() == 'tree':
                     img_data = {row[target_col]: cv2.imread(row[target_col]) for index, row in df_img_info.iterrows()}
@@ -904,8 +932,6 @@ class Data_Shapley_Dataset:
                     file_name = file.split('/')[-1].split('.')[0].upper()
                     X_embds_ret = None
                     df_file = df_file.fillna(-99)
-
-                    # Find for each tabular dataset his fair attr
                     fair_attrbs_groups = None
                     if self.use_fairness:
                         fair_attrbs_groups = self.create_group_labels(df_=df_file, task_label_col=self.label_class)
@@ -1088,18 +1114,6 @@ class Data_Shapley_Dataset:
         else:
             AssertionError('Error on reading file, did not exists')
 
-    def read_data_split_chunk(self, chunk_size, save_it=False):
-        if os.path.exists(self.datasets_path):
-            filename = self.datasets_path.split('/')[-1].split('.')[0].upper()
-            df = pd.read_csv(self.datasets_path)
-            dict_df = {f'{filename}_{c}': df.iloc[i:i + chunk_size] for c, i in
-                       enumerate(range(0, df.shape[0], chunk_size))}
-            if save_it:
-                self.save_data_chunks(data_chunks=dict_df)
-            return dict_df
-        else:
-            AssertionError('Error on reading file, did not exists')
-
     def save_output(self, method_name='fla_sh', ):
         if method_name.lower() == 'fla_sh':
             file_name = os.path.join(self.outpath, f'fla_sh.pickle')
@@ -1196,19 +1210,15 @@ class Data_Shapley_Dataset:
                         X = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if j in subset]
                         y = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if j in subset]
 
-                        X_with_i = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if
-                                    j in subset_with_i]
-                        y_with_i = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if
-                                    j in subset_with_i]
+                        X_with_i = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if j in subset_with_i]
+                        y_with_i = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if j in subset_with_i]
 
                         X = pd.concat(X, axis=0)
                         y = pd.concat(y, axis=0)
                         X_with_i = pd.concat(X_with_i, axis=0)
                         y_with_i = pd.concat(y_with_i, axis=0)
 
-                        value = self.itter_Data_Shapley(X=X, y=y,
-                                                        X_with_i=X_with_i, y_with_i=y_with_i,
-                                                        n=n, subset=subset)
+                        value = self.itter_Data_Shapley(X=X, y=y, X_with_i=X_with_i, y_with_i=y_with_i, n=n, subset=subset)
 
                         total_contribution += value
             shapley_values[i] = total_contribution
@@ -1365,6 +1375,7 @@ class Data_Shapley_Dataset:
     def subset_selection(self, data_dict, data_X, data_y, data_fair, subsets, lr, total_subset, th,
                          metrics, data_type, show_subsets=False, val_frac=0.1, use_gradient=True,
                          use_norm=True, fair_attrbs=None, exec_per_point=False):
+
         data_values = list(data_dict.values())
         data_dict_keys_lst = list(data_dict.keys())
         data_flags = {key: True for key in data_dict_keys_lst}
@@ -1459,16 +1470,16 @@ class Data_Shapley_Dataset:
                     if self.use_embeds and self.use_img:
                         model = create_model(model_type=self.model_type, problem=self.problem, max_epochs=1,
                                              batch_size=1,  lr=lr, val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=False,
-                                             use_NN=True, num_classes=self.num_of_classes,  norm=use_norm,
-                                             use_fairness=self.use_fairness, fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups,
-                                             lambda_fair=self.lambda_fair, fair_metric=self.fair_metric)
+                                             use_NN=True, num_classes=self.num_of_classes, norm=use_norm, use_fairness=self.use_fairness,
+                                             fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups, lambda_fair=self.lambda_fair,
+                                             fair_metric=self.fair_metric)
 
                     else:
                         model = create_model(model_type=self.model_type, problem=self.problem, max_epochs=1,
-                                             batch_size=1, lr=lr, val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img,
-                                             use_NN=True, num_classes=self.num_of_classes,  norm=use_norm, use_fairness=self.use_fairness,
-                                             fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups, lambda_fair=self.lambda_fair,
-                                             fair_metric=self.fair_metric)
+                                             batch_size=1,  lr=lr, val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img,
+                                             use_NN=True, num_classes=self.num_of_classes, norm=use_norm,  use_fairness=self.use_fairness,
+                                             fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups,
+                                             lambda_fair=self.lambda_fair, fair_metric=self.fair_metric)
 
                     fair_attrbs_train = fair_attrb_ if self.use_fairness else None
                     fair_attrbs_val = None
@@ -1494,8 +1505,7 @@ class Data_Shapley_Dataset:
                         X_val = None
                         y_val = None
                     model.fit(X=X_train, y=y_train, X_val=X_val, y_val=y_val, fair_attrbs=fair_attrbs_train,
-                              fair_attrbs_val=fair_attrbs_val, data_dict=None, batch_size=1, epochs=1,
-                              metric=self.metric)
+                              fair_attrbs_val=fair_attrbs_val, data_dict=None, batch_size=1, epochs=1, metric=self.metric)
                     if model.history['metrics'] and idx < len(model.history['metrics']):
                         new_metric = model.history['metrics'][idx]
                     elif model.history['metrics']:
@@ -1528,8 +1538,10 @@ class Data_Shapley_Dataset:
         return subsets, metrics
 
     def FLA_SHapley(self, data_dict=None, df_dict=None, err=0.9, total_subset=50, use_gradient=False, lr=0.001,
-                    chunk_size=None,  th=0.6, smart_selection=True, val_frac=0.1, show_subsets=False, use_hilbert_kernel=False,
-                    use_perm=True, SR=0.1, X_embeds=None, data_type='tabular', load_embeds=False, fair_attr_df=False,
+                    chunk_size=None,
+                    th=0.6, smart_selection=True, val_frac=0.1, show_subsets=False, use_hilbert_kernel=False,
+                    use_perm=True,
+                    SR=0.1, X_embeds=None, data_type='tabular', load_embeds=False, fair_attr_df=False,
                     use_fair_perm=False, alpha=0.7, exec_per_point=False):
         sr_shapley = True
 
@@ -1566,13 +1578,10 @@ class Data_Shapley_Dataset:
                 else:
                     all_labels.update(np.array(_y).ravel().tolist())
 
-            # Only do the integer-label check when labels are numeric
             try:
                 int_labels = [int(l) for l in all_labels]
-                # num_classes must be at least max_label + 1
                 required = max(int_labels) + 1
             except (ValueError, TypeError):
-                # String labels — fall back to count
                 required = len(all_labels)
 
             required = max(2, required)
@@ -1659,10 +1668,7 @@ class Data_Shapley_Dataset:
             elif data_type.lower() == 'tabular':
                 start_time = time.time()
                 if exec_per_point:
-                    data_arrays = [
-                        pd.concat([data_['X'], data_['Y']], axis=1).to_numpy().flatten()
-                        for name, data_ in data_dict.items()
-                    ]
+                    data_arrays = [pd.concat([data_['X'], data_['Y']], axis=1).to_numpy().flatten() for name, data_ in data_dict.items()]
                     max_dim = max(len(a) for a in data_arrays)
                     if max_dim >= 2:
                         all_data = np.vstack([a.reshape(1, -1) for a in data_arrays])
@@ -1675,10 +1681,7 @@ class Data_Shapley_Dataset:
                         dim = 2
                 else:
                     pca = PCA(n_components=dim)
-                    data_dim = [
-                        pd.concat([data_['X'], data_['Y']], axis=1).to_numpy()
-                        for name, data_ in data_dict.items()
-                    ]
+                    data_dim = [pd.concat([data_['X'], data_['Y']], axis=1).to_numpy() for name, data_ in data_dict.items()]
                     data_dim = [np.mean(pca.fit_transform(arr), axis=0) for arr in data_dim]
                 print(f'Finish embedding tabular data with PCA in {time.time() - start_time:.2f} seconds')
 
@@ -1923,11 +1926,9 @@ class Data_Shapley_Dataset:
                             if n_samples >= 10:
                                 try:
                                     if self.use_fairness:
-                                        X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrbs_val = train_test_split(
-                                            X, y, fair_attrb_, test_size=0.1, random_state=42)
+                                        X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrbs_val = train_test_split(X, y, fair_attrb_, test_size=0.1, random_state=42)
                                     else:
-                                        X_train, X_val, y_train, y_val = train_test_split(
-                                            X, y, test_size=0.1, random_state=42)
+                                        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=42)
                                 except Exception:
                                     X_train, y_train, X_val, y_val = X, y, X, y
                                     fair_attrbs_val = fair_attrb_ if self.use_fairness else None
@@ -1949,8 +1950,7 @@ class Data_Shapley_Dataset:
                                                          batch_size=1, val_frac=0.1, data_type=data_type)
                         else:
                             perf_with_i = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr,
-                                                         max_epochs=100, batch_size=1, val_frac=0.1,
-                                                         data_type=data_type)
+                                                         max_epochs=100, batch_size=1, val_frac=0.1, data_type=data_type)
 
                     weight = self.C / (n * (len(subset) + 1))
                     value = weight * (perf_with_i - metrics[j])
@@ -2094,10 +2094,9 @@ class Data_Shapley_Dataset:
                 all_labels.update(np.array(y_chunk).ravel().tolist())
         self.num_of_classes = max(2, len(all_labels))
 
-        return self.FLA_SHapley(data_dict=point_dict, df_dict=None, err=err, total_subset=total_subset,
-                                use_gradient=use_gradient, lr=lr, chunk_size=None, th=th,
-                                smart_selection=smart_selection,
-                                val_frac=val_frac, show_subsets=show_subsets, use_hilbert_kernel=use_hilbert_kernel,
-                                use_perm=use_perm, SR=SR, X_embeds=point_embeds, data_type=data_type,
-                                load_embeds=False, fair_attr_df=point_fair, use_fair_perm=use_fair_perm,
-                                alpha=alpha, exec_per_point=True)
+        return self.FLA_SHapley(
+            data_dict=point_dict, df_dict=None, err=err, total_subset=total_subset, use_gradient=use_gradient, lr=lr,
+            chunk_size=None, th=th, smart_selection=smart_selection, val_frac=val_frac, show_subsets=show_subsets,
+            use_hilbert_kernel=use_hilbert_kernel, use_perm=use_perm, SR=SR, X_embeds=point_embeds,
+            data_type=data_type, load_embeds=False, fair_attr_df=point_fair, use_fair_perm=use_fair_perm,
+            alpha=alpha, exec_per_point=True)

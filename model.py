@@ -550,6 +550,9 @@ class NN_model(nn.Module):
     def _make_img_batches(self, X, y, X_val, y_val,
                           fair_train, fair_val, use_val,
                           batch_size, idxs):
+        if not use_val:
+            X_val, y_val, fair_val = None, None, None
+
         def _s(arr, sl):
             if arr is None: return None
             if isinstance(arr, (pd.DataFrame, pd.Series)): return arr.iloc[sl]
@@ -719,6 +722,9 @@ class CNN_Model(NN_model):
             X = X.float().div_(255.0)
         elif X.dtype != torch.float32:
             X = X.float()
+
+        if X.max() > 2.0:
+            X = X / 255.0
 
         if X.dim() == 2:
             side = int(np.sqrt(X.shape[1]))
