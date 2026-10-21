@@ -1,4 +1,5 @@
 import sys
+import math
 
 import numpy as np
 import os
@@ -45,8 +46,16 @@ import itertools
 import glob
 import _pickle as pkl
 
-from utils_dataShapley import create_model, calculate_error, scale_to_grid, merge_small_chunks
+from utils_dataShapley import create_model, scale_to_grid, merge_small_chunks, _shapley_log_p, _chunk_inclusion_probs, \
+    _log_bernoulli_q, _sample_bernoulli_coalition, _sample_uniform_size_coalition, _sample_coalition_qtilde
 from utils import get_metric, transform_to_torch
+
+# Use cache to not reapet the expensive embedding computations for the same image or text file across multiple runs of the script.
+# The cache is keyed by absolute file path, so if the same file is used in multiple datasets, it will only be embedded once per run.
+_IMG_BASE_EMBED_CACHE = {}
+_IMG_FAIR_TXT_EMBED_CACHE = {}
+_CLIP_MODEL_CACHE = {}
+_IMG_PIXEL_CACHE = {}
 
 
 class Data_Shapley_Dataset:
@@ -80,6 +89,7 @@ class Data_Shapley_Dataset:
         self.model = create_model(self.model_type, problem=self.problem, max_epochs=1, batch_size=1, lr=0.0001,
                                   val_frac=0.1, hidden_layer_size=self.hidden_layers, num_classes=self.num_of_classes)
         self.values_ds_FLA_SH_run = None
+        self.last_fla_sh_rounds_run = None
         self.mc_ds = None
         self.vanilia_ds = None
         self.datasets_filenames = {}
@@ -137,10 +147,14 @@ class Data_Shapley_Dataset:
                     raise KeyError("Dataframe must contain a column named 'file_path', 'file', or 'filename'")
 
                 for idx, row in df.iterrows():
-                    img = cv2.imread(row[target_col])
+                    fpath = row[target_col]
+                    img = _IMG_PIXEL_CACHE.get(fpath)
                     if img is None:
-                        raise ValueError(f"cv2.imread failed for: {row[target_col]}")
-                    img = np.transpose(img, (2, 0, 1))  # (H,W,C) -> (C,H,W)
+                        img = cv2.imread(fpath)
+                        if img is None:
+                            raise ValueError(f"cv2.imread failed for: {fpath}")
+                        img = np.transpose(img, (2, 0, 1))  # (H,W,C) -> (C,H,W)
+                        _IMG_PIXEL_CACHE[fpath] = img
                     X_lst.append(img)
                 x_np = np.asarray(X_lst)
                 datasets_train_dict[file_name]['X'] = x_np
@@ -150,8 +164,10 @@ class Data_Shapley_Dataset:
             AssertionError(f'Filepath {self.datasets_path} did not exists!!')
 
     def prepare_chunks(self, df_dict, class_label="class"):
-        out_dict = {data_name.split('/')[-1].split('.')[0].upper(): {'X': None, 'Y': None} for data_name, _ in
-                    df_dict.items()}
+        out_dict = {
+            data_name.split('/')[-1].split('.')[0].upper(): {'X': None, 'Y': None}
+            for data_name, _ in df_dict.items()
+        }
 
         for data_name, df in df_dict.items():
             data_name = data_name.split('/')[-1].split('.')[0].upper()
@@ -159,16 +175,22 @@ class Data_Shapley_Dataset:
 
             if self.use_img and not self.use_embeds:
                 X_lst = []
-                target_col = next((c for c in ['file_path', 'filepath', 'file', 'filename'] if c in df.columns), None)
+                target_col = next(
+                    (c for c in ['file_path', 'filepath', 'file', 'filename']
+                     if c in df.columns), None)
                 if target_col is None:
                     raise KeyError(
                         "Image DataFrame must contain a file path column "
                         "('file_path', 'filepath', 'file', or 'filename')")
                 for idx, row in df.iterrows():
-                    img = cv2.imread(row[target_col])
+                    fpath = row[target_col]
+                    img = _IMG_PIXEL_CACHE.get(fpath)
                     if img is None:
-                        raise ValueError(f"cv2.imread failed for: {row[target_col]}")
-                    img = np.transpose(img, (2, 0, 1))  # (H,W,C) -> (C,H,W)
+                        img = cv2.imread(fpath)
+                        if img is None:
+                            raise ValueError(f"cv2.imread failed for: {fpath}")
+                        img = np.transpose(img, (2, 0, 1))  # (H,W,C) -> (C,H,W)
+                        _IMG_PIXEL_CACHE[fpath] = img
                     X_lst.append(img)
                 out_dict[data_name]['X'] = np.asarray(X_lst)
 
@@ -187,8 +209,9 @@ class Data_Shapley_Dataset:
                         cols_to_drop = []
                         if target_col is not None:
                             cols_to_drop.append(target_col)
-                        if (self.use_fairness and isinstance(self.fairness_attr,
-                                                             str) and self.fairness_attr in df.columns):
+                        # Dropped whether or not use_fairness is set: split_data also
+                        # stores it for use_fairness=False, for evaluation only.
+                        if (isinstance(self.fairness_attr, str) and self.fairness_attr in df.columns):
                             cols_to_drop.append(self.fairness_attr)
                         if cols_to_drop:
                             row_tuples = df.drop(columns=list(class_labels.columns) + cols_to_drop)
@@ -230,7 +253,10 @@ class Data_Shapley_Dataset:
             filenames = list(data.keys())
             class_lst = [None] * len(filenames)
         elif isinstance(data, str):
-            csv_path = (data if os.path.isabs(data) else os.path.join(os.path.dirname(os.path.abspath(self.datasets_path)), data))
+            # Must be a real CSV path
+            csv_path = (data if os.path.isabs(data)
+                        else os.path.join(os.path.dirname(
+                os.path.abspath(self.datasets_path)), data))
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(
                     f"convert_text_data_to_vectors received '{data}' which does not resolve to an existing file. Pass a DataFrame instead.")
@@ -370,13 +396,143 @@ class Data_Shapley_Dataset:
 
         return token_ids, out_df
 
+    def _get_clip_model_and_processor(self, device):
+
+        cached = _CLIP_MODEL_CACHE.get(device)
+        if cached is not None:
+            return cached
+        try:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True).to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True,
+                                                      local_files_only=True)
+        except Exception:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
+        model.eval()
+        _CLIP_MODEL_CACHE[device] = (model, processor)
+        return model, processor
+
+    def _compute_base_img_txt_embeddings(self, img_data, y_labels, batch_size=256):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, processor = self._get_clip_model_and_processor(device)
+
+        if isinstance(img_data, dict):
+            filenames = list(img_data.keys())
+        elif isinstance(img_data, str):
+            df = pd.read_csv(os.path.join(self.datasets_path, img_data))
+            filenames = df.get('file_path', df.get('filename')).tolist()
+        elif isinstance(img_data, pd.DataFrame):
+            filenames = img_data.get('file_path', img_data.get('filename')).tolist()
+
+        num_samples = len(filenames)
+        all_img, all_txt = [], []
+        for i in range(0, num_samples, batch_size):
+            batch_files = filenames[i:i + batch_size]
+
+            batch_labels = []
+            for f in batch_files:
+                val = self.idx_to_label[y_labels[f]]
+                if isinstance(val, (list, np.ndarray, pd.Series)):
+                    batch_labels.append(str(val[0]))
+                else:
+                    batch_labels.append(str(val))
+
+            batch_imgs = [Image.open(f).convert("RGB") for f in batch_files]
+
+            inputs = processor(
+                text=batch_labels,
+                images=batch_imgs,
+                return_tensors="pt",
+                padding=True
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+                all_img.append(outputs.image_embeds.cpu())
+                all_txt.append(outputs.text_embeds.cpu())
+
+        all_img = torch.cat(all_img, dim=0).numpy().astype(np.float64)
+        all_txt = torch.cat(all_txt, dim=0).numpy().astype(np.float64)
+
+        img_emb_dict = {str(f): all_img[i] for i, f in enumerate(filenames)}
+        txt_emb_dict = {str(f): all_txt[i] for i, f in enumerate(filenames)}
+        return img_emb_dict, txt_emb_dict
+
+    def _compute_fair_txt_embeddings(self, fair_feat, filenames, batch_size=256):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, processor = self._get_clip_model_and_processor(device)
+
+        if isinstance(fair_feat, (pd.DataFrame, pd.Series)):
+            fair_vals = np.asarray(fair_feat).flatten()
+        elif isinstance(fair_feat, np.ndarray):
+            fair_vals = fair_feat.flatten()
+        else:
+            fair_vals = list(fair_feat)
+        fair_texts = [str(feat) for feat in fair_vals]
+
+        num_samples = len(filenames)
+        all_fair = []
+        for i in range(0, num_samples, batch_size):
+            batch_fair = fair_texts[i:i + batch_size]
+            f_inputs = processor(text=batch_fair, return_tensors="pt", padding=True).to(device)
+            with torch.no_grad():
+                fair_emb = model.get_text_features(**f_inputs)
+                if hasattr(fair_emb, 'pooler_output'):
+                    fair_emb = fair_emb.pooler_output
+                all_fair.append(fair_emb.cpu())
+
+        all_fair = torch.cat(all_fair, dim=0).numpy().astype(np.float64)
+        return {str(f): all_fair[i] for i, f in enumerate(filenames)}
+
+    def _get_or_compute_img_embeddings(self, img_data, y_labels, fair_attrbs_raw_txt):
+        base_key = self.datasets_path
+        base_cached = _IMG_BASE_EMBED_CACHE.get(base_key)
+        if base_cached is not None:
+            print(f'Reusing cached CLIP base (image+label) embeddings for {self.datasets_path} '
+                  f'-- skipping recomputation.')
+            img_emb_dict, txt_emb_dict = base_cached
+        else:
+            start_time = time.time()
+            img_emb_dict, txt_emb_dict = self._compute_base_img_txt_embeddings(img_data=img_data, y_labels=y_labels)
+            print(f'Finish base (image+label) embedding with CLIP in {time.time() - start_time:.2f} seconds')
+            _IMG_BASE_EMBED_CACHE[base_key] = (img_emb_dict, txt_emb_dict)
+
+        fair_emb_dict = None
+        if self.use_fairness and fair_attrbs_raw_txt is not None:
+            fair_key = (self.datasets_path, self.fairness_attr)
+            fair_cached = _IMG_FAIR_TXT_EMBED_CACHE.get(fair_key)
+            if fair_cached is not None:
+                print(f'Reusing cached CLIP fairness-text embeddings for {self.datasets_path} '
+                      f'(fairness_attr={self.fairness_attr}) -- skipping recomputation.')
+                fair_emb_dict = fair_cached
+            else:
+                start_time = time.time()
+                fair_emb_dict = self._compute_fair_txt_embeddings(
+                    fair_feat=fair_attrbs_raw_txt, filenames=list(img_emb_dict.keys()))
+                print(f'Finish fairness-text embedding with CLIP in {time.time() - start_time:.2f} seconds')
+                _IMG_FAIR_TXT_EMBED_CACHE[fair_key] = fair_emb_dict
+
+        out_dict = {}
+        for f, img_v in img_emb_dict.items():
+            if fair_emb_dict is not None:
+                out_dict[f] = (img_v + txt_emb_dict[f] + fair_emb_dict[f]) / 3
+            else:
+                out_dict[f] = (img_v + txt_emb_dict[f]) / 2
+
+        return out_dict, img_emb_dict
+
     def convert_img_data_to_vectors(self, data, y_labels, fair_feat=None, allign_method='mean', batch_size=256):
         out_dict = {}
         out_dict_image_ebds = {}
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
+        try:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True).to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True,
+                                                      local_files_only=True)
+        except Exception:
+            model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
         model.eval()
 
         if isinstance(data, dict):
@@ -390,7 +546,7 @@ class Data_Shapley_Dataset:
         fair_texts = None
         if self.use_fairness and fair_feat is not None:
             if isinstance(fair_feat, (pd.DataFrame, pd.Series)):
-                fair_vals = fair_feat.values.flatten()
+                fair_vals = np.asarray(fair_feat).flatten()
             elif isinstance(fair_feat, np.ndarray):
                 fair_vals = fair_feat.flatten()
             else:
@@ -400,8 +556,6 @@ class Data_Shapley_Dataset:
         num_samples = len(filenames)
         all_fused = []
         all_images = []
-
-        print(f"Processing {num_samples} images in batches of {batch_size}!!")
 
         for i in range(0, num_samples, batch_size):
             batch_files = filenames[i: i + batch_size]
@@ -417,7 +571,12 @@ class Data_Shapley_Dataset:
 
             batch_imgs = [Image.open(f).convert("RGB") for f in batch_files]
 
-            inputs = processor(text=batch_labels, images=batch_imgs, return_tensors="pt", padding=True).to(device)
+            inputs = processor(
+                text=batch_labels,
+                images=batch_imgs,
+                return_tensors="pt",
+                padding=True
+            ).to(device)
 
             with torch.no_grad():
                 outputs = model(**inputs)
@@ -429,6 +588,8 @@ class Data_Shapley_Dataset:
                     batch_fair = fair_texts[i: i + batch_size]
                     f_inputs = processor(text=batch_fair, return_tensors="pt", padding=True).to(device)
                     fair_emb = model.get_text_features(**f_inputs)
+                    if hasattr(fair_emb, 'pooler_output'):
+                        fair_emb = fair_emb.pooler_output
 
                 if allign_method == 'mean':
                     if fair_emb is not None:
@@ -675,7 +836,7 @@ class Data_Shapley_Dataset:
         grandparent = os.path.dirname(parent_dir)
 
         missing_count = 0
-        hint = None
+        hint = None  # (suffix_start, base_dir) that resolved a previous row
 
         def resolve(path_value):
             nonlocal missing_count, hint
@@ -685,6 +846,9 @@ class Data_Shapley_Dataset:
                 return raw
 
             if os.path.isabs(raw):
+                # Absolute path from another machine (e.g. '/opt/dlami/nvme/...'):
+                # walk progressively shorter path suffixes and try re-rooting
+                # them near the dataset CSV.
                 parts = [p for p in raw.split(os.sep) if p]
                 if hint is not None:
                     start, base = hint
@@ -772,6 +936,7 @@ class Data_Shapley_Dataset:
 
         attr_names = [task_label_col] + list(sensitive_df.columns)
 
+        # data_arrays = [y] + [sensitive_df[col].values for col in sensitive_df.columns]
         combined = df_[attr_names].astype(str).agg(', '.join, axis=1)
         unique_combinations = sorted(combined.unique())
 
@@ -808,6 +973,7 @@ class Data_Shapley_Dataset:
                     self.labels_to_idx(df=df_img_info, idx_to_label=idx_to_label, class_label=self.label_class)
                     col = df_img_info[self.label_class]
                     mapped = col.map(self.label_to_idx)
+                    # rows whose values are already label indices (keys of idx_to_label) are kept as-is instead of mapping to NaN
                     mapped = mapped.fillna(col.where(col.isin(list(self.idx_to_label.keys()))))
                     if mapped.isna().any():
                         bad = col[mapped.isna()].unique()[:10]
@@ -848,11 +1014,10 @@ class Data_Shapley_Dataset:
                     print(f'Finish splitting by random in {time.time() - start_time:.2f} seconds')
 
                 elif split_by.lower() == 'tree':
-                    img_data = {row[target_col]: cv2.imread(row[target_col]) for index, row in df_img_info.iterrows()}
-                    start_time = time.time()
-                    X_embds, X_embeds_img = self.convert_img_data_to_vectors(data=img_data, y_labels=Y_labels,
-                                                                             fair_feat=fair_attrbs_raw_txt)
-                    print(f'Finish embedding with CLIP in {time.time() - start_time:.2f} seconds')
+                    # If an image embedding cache copy to image data otherwise compute it from scratch
+                    img_data = (None if self.datasets_path in _IMG_BASE_EMBED_CACHE else
+                                {row[target_col]: None for index, row in df_img_info.iterrows()})
+                    X_embds, X_embeds_img = self._get_or_compute_img_embeddings(img_data, Y_labels, fair_attrbs_raw_txt)
 
                     X_embds = [embds for path_, embds in X_embds.items()]
                     X_embds = np.asarray(X_embds, dtype=np.float64)
@@ -873,16 +1038,18 @@ class Data_Shapley_Dataset:
                         df_embeds[target_col] = df_img_info[target_col].to_list()
                         if self.use_fairness:
                             df_embeds[self.fairness_attr] = fair_attrbs_raw_txt
+                        elif isinstance(self.fairness_attr, str) and self.fairness_attr in df_img_info.columns:
+                            # Used only on fairness
+                            df_embeds[self.fairness_attr] = df_img_info[self.fairness_attr].to_list()
                         df_chunks = [df_embeds.iloc[idxs] for idxs in chunk_idxs.values()]
                     else:
                         df_chunks = [df_img_info.iloc[idxs] for idxs in chunk_idxs.values()]
                     X_embds_ret = [X_embeds_img[idxs] for idxs in chunk_idxs.values()]
                 elif split_by.lower() == 'cluster':
-                    img_data = {row[target_col]: cv2.imread(row[target_col]) for index, row in df_img_info.iterrows()}
-                    start_time = time.time()
-                    X_embds, X_embeds_img = self.convert_img_data_to_vectors(data=img_data, y_labels=Y_labels,
-                                                                             fair_feat=fair_attrbs_raw_txt)
-                    print(f'Finish embedding with CLIP in {time.time() - start_time:.2f} seconds')
+                    # Same reasoning as the 'tree' branch above.
+                    img_data = (None if self.datasets_path in _IMG_BASE_EMBED_CACHE else
+                                {row[target_col]: None for index, row in df_img_info.iterrows()})
+                    X_embds, X_embeds_img = self._get_or_compute_img_embeddings(img_data, Y_labels, fair_attrbs_raw_txt)
                     X_embds = [embds for path_, embds in X_embds.items()]
                     X_embds = np.asarray(X_embds, dtype=np.float64)
                     start_time = time.time()
@@ -903,6 +1070,9 @@ class Data_Shapley_Dataset:
                         df_embeds[target_col] = df_img_info[target_col].to_list()
                         if self.use_fairness:
                             df_embeds[self.fairness_attr] = fair_attrbs_raw_txt
+                        elif isinstance(self.fairness_attr, str) and self.fairness_attr in df_img_info.columns:
+                            # Used only in fairness
+                            df_embeds[self.fairness_attr] = df_img_info[self.fairness_attr].to_list()
                         df_chunks = [df_embeds.iloc[idxs] for idxs in chunk_idxs.values()]
                     else:
                         df_chunks = [df_img_info.iloc[idxs] for idxs in chunk_idxs.values()]
@@ -932,6 +1102,8 @@ class Data_Shapley_Dataset:
                     file_name = file.split('/')[-1].split('.')[0].upper()
                     X_embds_ret = None
                     df_file = df_file.fillna(-99)
+
+                    # Find for each tabular dataset his fair attr
                     fair_attrbs_groups = None
                     if self.use_fairness:
                         fair_attrbs_groups = self.create_group_labels(df_=df_file, task_label_col=self.label_class)
@@ -1114,6 +1286,18 @@ class Data_Shapley_Dataset:
         else:
             AssertionError('Error on reading file, did not exists')
 
+    def read_data_split_chunk(self, chunk_size, save_it=False):
+        if os.path.exists(self.datasets_path):
+            filename = self.datasets_path.split('/')[-1].split('.')[0].upper()
+            df = pd.read_csv(self.datasets_path)
+            dict_df = {f'{filename}_{c}': df.iloc[i:i + chunk_size] for c, i in
+                       enumerate(range(0, df.shape[0], chunk_size))}
+            if save_it:
+                self.save_data_chunks(data_chunks=dict_df)
+            return dict_df
+        else:
+            AssertionError('Error on reading file, did not exists')
+
     def save_output(self, method_name='fla_sh', ):
         if method_name.lower() == 'fla_sh':
             file_name = os.path.join(self.outpath, f'fla_sh.pickle')
@@ -1210,15 +1394,22 @@ class Data_Shapley_Dataset:
                         X = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if j in subset]
                         y = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if j in subset]
 
-                        X_with_i = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if j in subset_with_i]
-                        y_with_i = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if j in subset_with_i]
+                        X_with_i = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if
+                                    j in subset_with_i]
+                        y_with_i = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if
+                                    j in subset_with_i]
 
                         X = pd.concat(X, axis=0)
                         y = pd.concat(y, axis=0)
                         X_with_i = pd.concat(X_with_i, axis=0)
                         y_with_i = pd.concat(y_with_i, axis=0)
 
-                        value = self.itter_Data_Shapley(X=X, y=y, X_with_i=X_with_i, y_with_i=y_with_i, n=n, subset=subset)
+                        # Exact enumeration: every term is visited with its TRUE probability, so the weight is the classical Shapley coalition weight p(Z) directly
+                        # No importance-sampling ratio is needed here (there is no sampling; see itter_Data_Shapley's docstring).
+                        weight = math.exp(_shapley_log_p(subset_size, n))
+                        value = self.itter_Data_Shapley(X=X, y=y,
+                                                        X_with_i=X_with_i, y_with_i=y_with_i,
+                                                        weight=weight)
 
                         total_contribution += value
             shapley_values[i] = total_contribution
@@ -1229,14 +1420,18 @@ class Data_Shapley_Dataset:
         print('Duration: {}'.format(end_time - start_time))
         return Shap_values_dict
 
-    def itter_Data_Shapley(self, X, y, X_with_i, y_with_i, n, subset):
+    def itter_Data_Shapley(self, X, y, X_with_i, y_with_i, weight):
+        """
+            `weight` must be supplied by the caller: the classical Shapley coalition weight p(Z) for exact enumeration (vanilla_Data_Shapley),
+            or the importance-sampling ratio p(Z)/q(Z) for a sampling-based caller (monte_carlo_Data_Shap).
+            This method no longer computes a weight itself (it used to use the invalid fixed weight 1/(n*(|Z|+1))).
+        """
         perf_without_i = self.get_score(X=X, y=y, use_img=False, use_NN=False, lr=0.0001, max_epochs=1, batch_size=1,
                                         val_frac=0.1)
 
         perf_with_i = self.get_score(X=X_with_i, y=y_with_i, use_img=False, use_NN=False, lr=0.0001, max_epochs=1,
                                      batch_size=1, val_frac=0.1)
 
-        weight = self.C / (n * (len(subset) + 1))
         value = weight * (perf_with_i - perf_without_i)
         return value
 
@@ -1269,9 +1464,13 @@ class Data_Shapley_Dataset:
                 X_with_i = pd.concat(X_with_i, axis=0)
                 y_with_i = pd.concat(y_with_i, axis=0)
 
+                # Sampling-based: subset ~ Uniform{size 0..n-1} then uniform subset of the full n elements of that size.
+                s = len(subset)
+                log_q = -math.log(n) - math.lgamma(n + 1) + math.lgamma(s + 1) + math.lgamma(n - s + 1)
+                weight = math.exp(_shapley_log_p(s, n) - log_q)
                 value = self.itter_Data_Shapley(X=X, y=y,
                                                 X_with_i=X_with_i, y_with_i=y_with_i,
-                                                n=n, subset=subset)
+                                                weight=weight)
 
                 total_contribution += value
             shapley_values[i] = total_contribution
@@ -1283,12 +1482,16 @@ class Data_Shapley_Dataset:
         return Shap_values_dict
 
     def execute_per_dataset(self, split_data=False, chunk_size=200, k=50, split_by='ordered', use_hilbert_kernel=False,
-                            err=0.9, th=0.5, smart_selection=True, show_subsets=False, data_type='tabular',
+                            err=0.001, th=0.5, smart_selection=True, show_subsets=False, data_type='tabular',
                             use_perm=True, ret_embeds=False, convert_label=False, idx_to_label={},
-                            use_fair_permutation=False):
-        # Check if we need to split data to chunks with chunk partitioning
+                            use_fair_permutation=False, method='FLA-SH', r_max=1):
         if self.use_fairness:
             use_fair_permutation = True
+        if method == 'C-DaSh' and split_by != 'ordered':
+            print(f"[execute_per_dataset] method='C-DaSh' uses order "
+                  f"partitioning by definition -- overriding split_by="
+                  f"{split_by!r} to 'ordered'.")
+            split_by = 'ordered'
         if split_data:
             # Apply chunk partitioning and create chunks
             data, X_embed, fair_attr_groups = self.split_data(chunk_size=chunk_size, split_by=split_by, save_it=True,
@@ -1306,22 +1509,24 @@ class Data_Shapley_Dataset:
                 else:
                     input_fair_attrbs = None
                 if show_subsets:
-                    Shap_values_dict, subsets_ = self.FLA_SHapley(data_dict=df_dict_prepared, df_dict=df_dict, err=0.9,
-                                                                  total_subset=k, use_gradient=True, chunk_size=None,
-                                                                  th=th, smart_selection=smart_selection,
+                    Shap_values_dict, subsets_ = self.FLA_SHapley(data_dict=df_dict_prepared, df_dict=df_dict, err=err,
+                                                                  r_max=r_max, total_subset=k, use_gradient=True,
+                                                                  chunk_size=None, th=th,
+                                                                  smart_selection=smart_selection,
                                                                   show_subsets=show_subsets,
                                                                   use_hilbert_kernel=use_hilbert_kernel,
                                                                   X_embeds=X_embed, use_perm=use_perm,
                                                                   fair_attr_df=input_fair_attrbs,
-                                                                  use_fair_perm=use_fair_permutation)
+                                                                  use_fair_perm=use_fair_permutation, method=method)
                     selected_subsets += subsets_
                 else:
-                    Shap_values_dict = self.FLA_SHapley(data_dict=df_dict_prepared, df_dict=df_dict, err=0.9,
-                                                        total_subset=k, use_gradient=True, chunk_size=None, th=th,
-                                                        smart_selection=smart_selection, show_subsets=show_subsets,
+                    Shap_values_dict = self.FLA_SHapley(data_dict=df_dict_prepared, df_dict=df_dict, err=err,
+                                                        r_max=r_max, total_subset=k, use_gradient=True, chunk_size=None,
+                                                        th=th, smart_selection=smart_selection,
+                                                        show_subsets=show_subsets,
                                                         use_hilbert_kernel=use_hilbert_kernel, X_embeds=X_embed,
                                                         use_perm=use_perm, fair_attr_df=input_fair_attrbs,
-                                                        use_fair_perm=use_fair_permutation)
+                                                        use_fair_perm=use_fair_permutation, method=method)
                 dataset_avg = np.mean(list(Shap_values_dict.values()))
                 out_avg[file_name] = dataset_avg
                 out_shapley_values[file_name] = Shap_values_dict
@@ -1350,19 +1555,21 @@ class Data_Shapley_Dataset:
                 split_points = np.cumsum(chunk_lengths)[:-1]
                 input_fair_attrbs = list(np.split(fair_attrbs_groups, split_points))
             if show_subsets:
-                Shap_values_dict, subsets_ = self.FLA_SHapley(data_dict=data_dict, err=0.9, total_subset=k,
+                Shap_values_dict, subsets_ = self.FLA_SHapley(data_dict=data_dict, err=err, r_max=r_max, total_subset=k,
                                                               use_gradient=True, chunk_size=None,
                                                               th=th, smart_selection=smart_selection,
                                                               show_subsets=show_subsets,
                                                               use_hilbert_kernel=use_hilbert_kernel, X_embeds=None,
-                                                              use_perm=use_perm, fair_attr_df=input_fair_attrbs)
+                                                              use_perm=use_perm, fair_attr_df=input_fair_attrbs,
+                                                              method=method)
                 selected_subsets += subsets_
             else:
-                Shap_values_dict = self.FLA_SHapley(data_dict=data_dict, err=0.9, total_subset=k, use_gradient=True,
-                                                    chunk_size=None, th=th,
+                Shap_values_dict = self.FLA_SHapley(data_dict=data_dict, err=err, r_max=r_max, total_subset=k,
+                                                    use_gradient=True, chunk_size=None, th=th,
                                                     smart_selection=smart_selection, show_subsets=show_subsets,
                                                     use_hilbert_kernel=use_hilbert_kernel,
-                                                    X_embeds=None, use_perm=use_perm, fair_attr_df=input_fair_attrbs)
+                                                    X_embeds=None, use_perm=use_perm, fair_attr_df=input_fair_attrbs,
+                                                    method=method)
             if show_subsets:
                 print(f'Selected subsets : ')
                 print(selected_subsets)
@@ -1375,7 +1582,6 @@ class Data_Shapley_Dataset:
     def subset_selection(self, data_dict, data_X, data_y, data_fair, subsets, lr, total_subset, th,
                          metrics, data_type, show_subsets=False, val_frac=0.1, use_gradient=True,
                          use_norm=True, fair_attrbs=None, exec_per_point=False):
-
         data_values = list(data_dict.values())
         data_dict_keys_lst = list(data_dict.keys())
         data_flags = {key: True for key in data_dict_keys_lst}
@@ -1401,7 +1607,7 @@ class Data_Shapley_Dataset:
 
             attempts = 0
 
-            while (eq_(metrics[idx], th) or flag):
+            while eq_(metrics[idx], th) or flag:
                 if attempts >= 2:
                     break
 
@@ -1468,18 +1674,36 @@ class Data_Shapley_Dataset:
                         val_frac = np.ceil(required_frac * 100) / 100
 
                     if self.use_embeds and self.use_img:
-                        model = create_model(model_type=self.model_type, problem=self.problem, max_epochs=1,
-                                             batch_size=1,  lr=lr, val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=False,
-                                             use_NN=True, num_classes=self.num_of_classes, norm=use_norm, use_fairness=self.use_fairness,
-                                             fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups, lambda_fair=self.lambda_fair,
+                        model = create_model(model_type=self.model_type,
+                                             problem=self.problem,
+                                             max_epochs=1,
+                                             batch_size=1,
+                                             lr=lr,
+                                             val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=False,
+                                             use_NN=True,
+                                             num_classes=self.num_of_classes,
+                                             norm=use_norm,
+                                             use_fairness=self.use_fairness,
+                                             fairness_attr=self.fairness_attr,
+                                             num_of_fair=self.num_of_groups,
+                                             lambda_fair=self.lambda_fair,
                                              fair_metric=self.fair_metric)
 
                     else:
-                        model = create_model(model_type=self.model_type, problem=self.problem, max_epochs=1,
-                                             batch_size=1,  lr=lr, val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img,
-                                             use_NN=True, num_classes=self.num_of_classes, norm=use_norm,  use_fairness=self.use_fairness,
-                                             fairness_attr=self.fairness_attr, num_of_fair=self.num_of_groups,
-                                             lambda_fair=self.lambda_fair, fair_metric=self.fair_metric)
+                        model = create_model(model_type=self.model_type,
+                                             problem=self.problem,
+                                             max_epochs=1,
+                                             batch_size=1,
+                                             lr=lr,
+                                             val_frac=0.1, hidden_layer_size=self.hidden_layers, use_img=self.use_img,
+                                             use_NN=True,
+                                             num_classes=self.num_of_classes,
+                                             norm=use_norm,
+                                             use_fairness=self.use_fairness,
+                                             fairness_attr=self.fairness_attr,
+                                             num_of_fair=self.num_of_groups,
+                                             lambda_fair=self.lambda_fair,
+                                             fair_metric=self.fair_metric)
 
                     fair_attrbs_train = fair_attrb_ if self.use_fairness else None
                     fair_attrbs_val = None
@@ -1505,14 +1729,13 @@ class Data_Shapley_Dataset:
                         X_val = None
                         y_val = None
                     model.fit(X=X_train, y=y_train, X_val=X_val, y_val=y_val, fair_attrbs=fair_attrbs_train,
-                              fair_attrbs_val=fair_attrbs_val, data_dict=None, batch_size=1, epochs=1, metric=self.metric)
+                              fair_attrbs_val=fair_attrbs_val, data_dict=None, batch_size=1, epochs=1,
+                              metric=self.metric)
                     if model.history['metrics'] and idx < len(model.history['metrics']):
                         new_metric = model.history['metrics'][idx]
                     elif model.history['metrics']:
-                        # metrics list is shorter than idx — take the last available value
                         new_metric = model.history['metrics'][-1]
                     else:
-                        # no val metrics recorded at all (all batches had None val slots)
                         new_metric = 0.0
                 else:
                     if self.use_img and self.use_embeds:
@@ -1537,13 +1760,28 @@ class Data_Shapley_Dataset:
 
         return subsets, metrics
 
-    def FLA_SHapley(self, data_dict=None, df_dict=None, err=0.9, total_subset=50, use_gradient=False, lr=0.001,
+    def FLA_SHapley(self, data_dict=None, df_dict=None, err=0.001, total_subset=50, use_gradient=False, lr=0.001,
                     chunk_size=None,
                     th=0.6, smart_selection=True, val_frac=0.1, show_subsets=False, use_hilbert_kernel=False,
                     use_perm=True,
                     SR=0.1, X_embeds=None, data_type='tabular', load_embeds=False, fair_attr_df=False,
-                    use_fair_perm=False, alpha=0.7, exec_per_point=False):
-        sr_shapley = True
+                    use_fair_perm=False, alpha=0.7, exec_per_point=False,
+                    epsilon=0.1, priority_strength=0.5, method='FLA-SH', r_max=1):
+        """
+        `method` selects which coalition-sampling / weighting scheme is used: 'FLA-SH' (default) or 'C-DaSh'
+        Round control
+          err   : truncation tolerance EPSILON on THIS ROUND's mean absolute
+                  marginal contribution.
+          r_max : hard cap on the number of rounds (R_max). The round loop
+                  runs at most r_max rounds regardless of whether the
+                  truncation criterion above is ever met.
+        """
+        if method not in ('FLA-SH', 'C-DaSh'):
+            raise ValueError(f"FLA_SHapley: unknown method={method!r}, expected 'FLA-SH' or 'C-DaSh'")
+        if method == 'FLA-SH' and smart_selection:
+            print('[FLA_SHapley]: with unbiased smart_selection is ignored")')
+        elif method == 'C-DaSh':
+            print('[FLA_SHapley] but using the C-DaSh approximation method')
 
         if data_type == 'text':
             use_norm = False
@@ -1578,10 +1816,13 @@ class Data_Shapley_Dataset:
                 else:
                     all_labels.update(np.array(_y).ravel().tolist())
 
+            # Only do the integer-label check when labels are numeric
             try:
                 int_labels = [int(l) for l in all_labels]
+                # num_classes must be at least max_label + 1
                 required = max(int_labels) + 1
             except (ValueError, TypeError):
+                # String labels — fall back to count
                 required = len(all_labels)
 
             required = max(2, required)
@@ -1590,6 +1831,41 @@ class Data_Shapley_Dataset:
                 print(
                     f'FLA_SHapley: adjusting num_of_classes {self.num_of_classes} -> {required} (max label={max(int_labels) if "int_labels" in dir() else "?"}, unique={len(all_labels)})')
                 self.num_of_classes = required
+
+        # v(empty coalition) so meet the Lemma-4.3 where needs a defined
+        # utility for Z=empty (p(empty) = (c-1)!/c! = 1/c is a non-negligible,
+        # required term of the exact Shapley sum -- excluding it would itself
+        # be a form of data-dependent bias). There is no data to fit a model
+        # on for the empty coalition, so we use the "zero-information"
+        # baseline matching self.metric, computed once from the pooled labels
+        # (no model fit, cannot crash on empty training data).
+        _all_y_pooled = []
+        for _vals in data_dict.values():
+            _y = _vals['Y']
+            if isinstance(_y, pd.DataFrame):
+                _all_y_pooled.append(_y.values.ravel())
+            elif isinstance(_y, pd.Series):
+                _all_y_pooled.append(_y.to_numpy().ravel())
+            else:
+                _all_y_pooled.append(np.asarray(_y).ravel())
+        _all_y_pooled = np.concatenate(_all_y_pooled)
+
+        _metric_l = self.metric.lower()
+        if _metric_l == 'accuracy':
+            _vals_, _counts_ = np.unique(_all_y_pooled, return_counts=True)
+            v_empty = float(_counts_.max() / _counts_.sum())
+        elif _metric_l == 'f1-score':
+            _vals_, _counts_ = np.unique(_all_y_pooled, return_counts=True)
+            _maj_label = _vals_[np.argmax(_counts_)]
+            _const_pred = np.full_like(_all_y_pooled, _maj_label)
+            v_empty = float(get_metric(metric='f1-score', y_pred=_const_pred, y=_all_y_pooled))
+        elif _metric_l in ('mse', 'rmse'):
+            _mse_ = float(np.var(_all_y_pooled))
+            v_empty = _mse_ if _metric_l == 'mse' else float(np.sqrt(_mse_))
+        elif _metric_l == 'auc':
+            v_empty = 0.5
+        else:
+            v_empty = 0.0
 
         # Perform Hilbert Kernel Permutation
         if use_hilbert_kernel and use_perm:
@@ -1640,7 +1916,7 @@ class Data_Shapley_Dataset:
                         for filename, chunk in df_dict.items():
                             X_embds = chunk['X']
                             data_dim.append(np.mean(list(X_embds), axis=0))
-                            X_embeds_lst.append(X_embds)
+                            X_embeds_lst.append(X_embds)  # FIX: was X_embeds (outer param)
                         data_dim = np.asarray(data_dim)
                         dim = data_dim[0].shape[0]
                         X_embeds = X_embeds_lst
@@ -1649,7 +1925,7 @@ class Data_Shapley_Dataset:
                         for filename, chunk in df_dict.items():
                             X_embds, df_text_info = self.convert_text_data_to_vectors(data=chunk)
                             data_dim.append(np.mean(list(X_embds.values()), axis=0))
-                            X_embeds_lst.append(np.array(list(X_embds.values())))
+                            X_embeds_lst.append(np.array(list(X_embds.values())))  # FIX: was X_embeds
                         data_dim = np.asarray(data_dim)
                         dim = data_dim[0].shape[0]
                         X_embeds = X_embeds_lst
@@ -1668,7 +1944,10 @@ class Data_Shapley_Dataset:
             elif data_type.lower() == 'tabular':
                 start_time = time.time()
                 if exec_per_point:
-                    data_arrays = [pd.concat([data_['X'], data_['Y']], axis=1).to_numpy().flatten() for name, data_ in data_dict.items()]
+                    data_arrays = [
+                        pd.concat([data_['X'], data_['Y']], axis=1).to_numpy().flatten()
+                        for name, data_ in data_dict.items()
+                    ]
                     max_dim = max(len(a) for a in data_arrays)
                     if max_dim >= 2:
                         all_data = np.vstack([a.reshape(1, -1) for a in data_arrays])
@@ -1681,7 +1960,10 @@ class Data_Shapley_Dataset:
                         dim = 2
                 else:
                     pca = PCA(n_components=dim)
-                    data_dim = [pd.concat([data_['X'], data_['Y']], axis=1).to_numpy() for name, data_ in data_dict.items()]
+                    data_dim = [
+                        pd.concat([data_['X'], data_['Y']], axis=1).to_numpy()
+                        for name, data_ in data_dict.items()
+                    ]
                     data_dim = [np.mean(pca.fit_transform(arr), axis=0) for arr in data_dim]
                 print(f'Finish embedding tabular data with PCA in {time.time() - start_time:.2f} seconds')
 
@@ -1767,11 +2049,11 @@ class Data_Shapley_Dataset:
                         sensitive_fair_attrbs = [fair_attrbs[i] for i in random_indices]
 
                 if self.use_embeds and self.use_img:
-                    score_ = self.get_score(X=X_, y=y_, use_img=False, use_NN=True, lr=lr, max_epochs=10, batch_size=1,
+                    score_ = self.get_score(X=X_, y=y_, use_img=False, use_NN=True, lr=lr, max_epochs=1, batch_size=1,
                                             val_frac=val_frac, data_type=data_type,
                                             fair_attr_df=sensitive_fair_attrbs, )
                 else:
-                    score_ = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=True, lr=lr, max_epochs=10,
+                    score_ = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=True, lr=lr, max_epochs=1,
                                             batch_size=1, val_frac=val_frac, data_type=data_type,
                                             fair_attr_df=sensitive_fair_attrbs)
                 scores_tmp[key] = score_
@@ -1784,22 +2066,51 @@ class Data_Shapley_Dataset:
             print(f'Finish SR permutation in {time.time() - start_time:.2f} seconds')
 
         memory_ds = np.zeros((n, total_subset))
-        metrics = []
-        itter_count = 0
 
-        while sr_shapley:
-            subsets = [set(random.sample(range(i), random.randint(0, i))) for i in range(2, total_subset + 2)]
-            print(f'Itteration {itter_count + 1}')
+        if method != 'C-DaSh':
+            _pi = _chunk_inclusion_probs(n, strength=priority_strength)
+            _coalition_rng = np.random.default_rng(np.random.randint(0, 2 ** 31 - 1))
+
+        assert r_max >= 1, f"r_max must be >= 1, got {r_max}"
+        round_mean_abs_delta = None
+        for itter_count in range(r_max):
+            # Reset per round: metrics[idx] must line up with THIS round's subsets[idx] (0..total_subset-1). Appending across rounds
+            # without resetting would silently misalign metrics[j] lookups in the marginal-contribution loop below for round 2+,
+            # latent since r_max previously never exceeded 1 in practice.
+            metrics = []
+            subsets = []
+            importance_weights = None  # only populated/used for method='FLA-SH'
+            if method == 'C-DaSh':
+                for _ in range(total_subset):
+                    subset = set()
+                    attempts = 0
+                    while len(subset) == 0 and attempts < 20:
+                        size = random.randint(0, n - 1)
+                        subset = set(random.sample(range(n), size))
+                        attempts += 1
+                    if len(subset) == 0:
+                        subset = {random.randrange(n)}
+                    subsets.append(subset)
+            else:
+
+                importance_weights = []
+                for _ in range(total_subset):
+                    _Z, _w = _sample_coalition_qtilde(n, _pi, epsilon, _coalition_rng)
+                    subsets.append(_Z)
+                    importance_weights.append(_w)
+            print(f'Itteration {itter_count + 1}/{r_max}')
 
             if use_gradient:
                 data_X = []
                 data_y = []
                 data_fair = []
+            included_original_idxs = []
 
             for idx, subset in enumerate(tqdm(subsets)):
-                while len(subset) == 0:
-                    subset = set(random.sample(range(idx + 2), random.randint(0, idx + 2)))
-                    subsets[idx] = subset
+                if len(subset) == 0:
+                    # v(empty) is a fixed baseline (see above), no data to fit a model on, and no batched-fit entry is needed.
+                    metrics.append(v_empty)
+                    continue
 
                 X = [data_['X'] for j, data_ in enumerate(list(data_dict.values())) if j in subset]
                 y = [data_['Y'] for j, data_ in enumerate(list(data_dict.values())) if j in subset]
@@ -1825,6 +2136,7 @@ class Data_Shapley_Dataset:
                     data_y.append(y)
                     if self.use_fairness:
                         data_fair.append(fair_attrb_)
+                    included_original_idxs.append(idx)
                     metrics.append(0)
                 else:
                     if self.use_embeds and self.use_img:
@@ -1836,7 +2148,7 @@ class Data_Shapley_Dataset:
                             self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr, max_epochs=1,
                                            batch_size=1, val_frac=0.1, data_type=data_type))
 
-            if use_gradient:
+            if use_gradient and data_X:
                 if self.use_embeds and self.use_img:
                     model = create_model(model_type=self.model_type,
                                          problem=self.problem, max_epochs=1, batch_size=1, lr=lr,
@@ -1855,20 +2167,29 @@ class Data_Shapley_Dataset:
                                          fair_metric=self.fair_metric)
 
                 fair_attrbs_train = data_fair if self.use_fairness else None
+
                 model.fit(X=data_X, y=data_y, X_val=None, y_val=None, fair_attrbs=fair_attrbs_train, data_dict=None,
-                          batch_size=1, epochs=1, metric=self.metric)
+                          batch_size=1, epochs=1, metric=self.metric,
+                          release_inputs=(method != 'C-DaSh'))
 
                 for i, index in enumerate(model.history['idxs']):
-                    metrics[index] = model.history['metrics'][i]
+                    metrics[included_original_idxs[index]] = model.history['metrics'][i]
 
-            if smart_selection:
-                subsets, metrics = self.subset_selection(data_dict=data_dict, data_X=data_X, data_y=data_y,
-                                                         data_fair=data_fair, subsets=subsets, lr=lr,
-                                                         total_subset=total_subset, th=th,
-                                                         metrics=metrics, show_subsets=show_subsets, val_frac=val_frac,
-                                                         use_norm=use_norm, data_type=data_type,
-                                                         fair_attrbs=fair_attr_df, use_gradient=use_gradient,
-                                                         exec_per_point=exec_per_point)
+            if method == 'C-DaSh':
+                if use_gradient:
+                    subsets, metrics = self.subset_selection(
+                        data_dict=data_dict, data_X=data_X, data_y=data_y, data_fair=data_fair,
+                        subsets=subsets, lr=lr, total_subset=total_subset, th=th, metrics=metrics,
+                        data_type=data_type, show_subsets=show_subsets, val_frac=val_frac,
+                        use_gradient=use_gradient, use_norm=use_norm, fair_attrbs=fair_attr_df,
+                        exec_per_point=exec_per_point)
+                else:
+                    print("[FLA_SHapley] method='C-DaSh' with use_gradient=False: "
+                          "subset_selection() only implements the gradient-batched path -- "
+                          "skipping the resample filter for this call (using the initial "
+                          "uniform-random subsets/metrics unfiltered).")
+            else:
+                pass
 
             if show_subsets:
                 subset_names = []
@@ -1878,6 +2199,8 @@ class Data_Shapley_Dataset:
                             subset_names.append(data_name)
 
             marginal_contrib = np.zeros((n, total_subset))
+            computed_mask = np.zeros((n, total_subset), dtype=bool)
+
             if self.use_embeds and self.use_img:
                 model = create_model(model_type=self.model_type,
                                      problem=self.problem, max_epochs=1, batch_size=1, lr=lr,
@@ -1897,7 +2220,7 @@ class Data_Shapley_Dataset:
 
             for i in tqdm(range(n)):
                 for j, subset in enumerate(subsets):
-                    if i in subset or len(subset) == 0:
+                    if i in subset:
                         continue
                     subset_with_i = subset | {i}
                     X = [data_['X'] for k, data_ in enumerate(list(data_dict.values())) if k in subset_with_i]
@@ -1926,9 +2249,11 @@ class Data_Shapley_Dataset:
                             if n_samples >= 10:
                                 try:
                                     if self.use_fairness:
-                                        X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrbs_val = train_test_split(X, y, fair_attrb_, test_size=0.1, random_state=42)
+                                        X_train, X_val, y_train, y_val, fair_attrbs_train, fair_attrbs_val = train_test_split(
+                                            X, y, fair_attrb_, test_size=0.1, random_state=42)
                                     else:
-                                        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=42)
+                                        X_train, X_val, y_train, y_val = train_test_split(
+                                            X, y, test_size=0.1, random_state=42)
                                 except Exception:
                                     X_train, y_train, X_val, y_val = X, y, X, y
                                     fair_attrbs_val = fair_attrb_ if self.use_fairness else None
@@ -1946,29 +2271,43 @@ class Data_Shapley_Dataset:
                         perf_with_i = model.history['metrics'][-1]
                     else:
                         if self.use_img and self.use_embeds:
-                            perf_with_i = self.get_score(X=X_, y=y_, use_img=False, use_NN=False, lr=lr, max_epochs=100,
+                            perf_with_i = self.get_score(X=X_, y=y_, use_img=False, use_NN=False, lr=lr, max_epochs=1,
                                                          batch_size=1, val_frac=0.1, data_type=data_type)
                         else:
                             perf_with_i = self.get_score(X=X_, y=y_, use_img=self.use_img, use_NN=False, lr=lr,
-                                                         max_epochs=100, batch_size=1, val_frac=0.1, data_type=data_type)
+                                                         max_epochs=1, batch_size=1, val_frac=0.1, data_type=data_type)
 
-                    weight = self.C / (n * (len(subset) + 1))
+                    if method == 'C-DaSh':
+                        # C-DaSh fixed weight 1/(n*(|Z|+1))
+                        weight = 1.0 / (n * (len(subset) + 1))
+                    else:
+                        weight = importance_weights[j]
                     value = weight * (perf_with_i - metrics[j])
                     marginal_contrib[i, j] = value
+                    computed_mask[i, j] = True
 
             if itter_count == 0:
                 memory_ds = marginal_contrib
             else:
                 memory_ds = np.concatenate([memory_ds, marginal_contrib])
 
-            print(f'Trancation error at iteration {itter_count} : {calculate_error(memory_ds)}')
-            if calculate_error(memory_ds) < err:
+            if computed_mask.any():
+                round_mean_abs_delta = float(np.abs(marginal_contrib[computed_mask]).mean())
+            else:
+                round_mean_abs_delta = 0.0
+            print(f'Round {itter_count + 1}/{r_max}: mean |marginal contribution| = {round_mean_abs_delta:.6f} (epsilon={err})')
+            if round_mean_abs_delta < err:
+                print(f'Truncation criterion met after {itter_count + 1}/{r_max} round(s) we are stopping.')
                 break
-            itter_count += 1
+        else:
+            print(f'Round budget R_max={r_max} reached without meeting the truncation '
+                  f'criterion (last round\'s mean |marginal contribution| = '
+                  f'{round_mean_abs_delta:.6f}, epsilon={err}) -- stopping.')
 
-        print(f'Final Trancation error : {calculate_error(memory_ds)}')
         Shap_values_dict = {key: np.mean(memory_ds[i]) for i, key in enumerate(data_dict.keys())}
         self.values_ds_FLA_SH_run = Shap_values_dict
+
+        self.last_fla_sh_rounds_run = itter_count + 1
 
         if show_subsets:
             return Shap_values_dict, subset_names
@@ -1978,7 +2317,7 @@ class Data_Shapley_Dataset:
             else:
                 return Shap_values_dict
 
-    def FLA_SHapley_per_point(self, data_dict=None, df_dict=None, err=0.9, total_subset=50,
+    def FLA_SHapley_per_point(self, data_dict=None, df_dict=None, err=0.001, total_subset=50,
                               use_gradient=True, lr=0.001, th=0.6, smart_selection=True,
                               val_frac=0.1, show_subsets=False, use_hilbert_kernel=False,
                               use_perm=True, SR=0.1, X_embeds=None, data_type='tabular',
@@ -2095,8 +2434,25 @@ class Data_Shapley_Dataset:
         self.num_of_classes = max(2, len(all_labels))
 
         return self.FLA_SHapley(
-            data_dict=point_dict, df_dict=None, err=err, total_subset=total_subset, use_gradient=use_gradient, lr=lr,
-            chunk_size=None, th=th, smart_selection=smart_selection, val_frac=val_frac, show_subsets=show_subsets,
-            use_hilbert_kernel=use_hilbert_kernel, use_perm=use_perm, SR=SR, X_embeds=point_embeds,
-            data_type=data_type, load_embeds=False, fair_attr_df=point_fair, use_fair_perm=use_fair_perm,
-            alpha=alpha, exec_per_point=True)
+            data_dict=point_dict,
+            df_dict=None,
+            err=err,
+            total_subset=total_subset,
+            use_gradient=use_gradient,
+            lr=lr,
+            chunk_size=None,
+            th=th,
+            smart_selection=smart_selection,
+            val_frac=val_frac,
+            show_subsets=show_subsets,
+            use_hilbert_kernel=use_hilbert_kernel,
+            use_perm=use_perm,
+            SR=SR,
+            X_embeds=point_embeds,
+            data_type=data_type,
+            load_embeds=False,
+            fair_attr_df=point_fair,
+            use_fair_perm=use_fair_perm,
+            alpha=alpha,
+            exec_per_point=True
+        )
