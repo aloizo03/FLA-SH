@@ -7,6 +7,51 @@ from sklearn.metrics import mean_squared_error, roc_auc_score, root_mean_squared
 import torch
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
+import re
+
+
+def drop_index_columns(df):
+    cols = [c for c in df.columns
+            if str(c).strip() == '' or re.fullmatch(r'Unnamed: \d+(\.\d+)?', str(c))]
+    return df.drop(columns=cols) if cols else df
+
+CATEGORICAL_COLUMNS = {
+    'Work_Cls', 'workclass', 'marital-status', 'occupation', 'relationship', 'race', 'native-country',
+    'job', 'marital', 'education', 'contact', 'month', 'poutcome',
+}
+
+# 'onehot_zscore' (default): FeatureTransform below. 'legacy': the previous
+# per-row L2 normalisation (valuation) / numeric-only StandardScaler (retraining).
+PREPROCESSING_MODES = ('onehot_zscore', 'legacy')
+
+
+class FeatureTransform:
+    """One-hot encode CATEGORICAL_COLUMNS and z-score every other column.
+    Fitted once on the training split only; apply it unchanged to val/test."""
+
+    def __init__(self, X_train, categorical=None):
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import OneHotEncoder, StandardScaler
+        X_train = drop_index_columns(pd.DataFrame(X_train))
+        self.columns = list(X_train.columns)
+        cat_set = CATEGORICAL_COLUMNS if categorical is None else set(categorical)
+        self.categorical = [c for c in self.columns if c in cat_set]
+        numeric = [c for c in self.columns if c not in cat_set]
+        try:
+            ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+        except TypeError:   # scikit-learn < 1.2
+            ohe = OneHotEncoder(handle_unknown='ignore', sparse=False)
+        self.ct = ColumnTransformer([('cat', ohe, self.categorical), ('num', StandardScaler(), numeric)])
+        self.ct.fit(X_train)
+
+    def __call__(self, X):
+        # Arrays carry no column names: assume the training column order.
+        if isinstance(X, pd.DataFrame):
+            X = drop_index_columns(X)[self.columns]
+        else:
+            X = pd.DataFrame(np.asarray(X), columns=self.columns)
+        return np.asarray(self.ct.transform(X), dtype=np.float32)
+
 
 class GroupDRO:
     def __init__(self, n_groups, eta=0.1, device='cpu'):
@@ -25,7 +70,7 @@ class GroupDRO:
         return torch.sum(q * group_losses)
 
     
-def group_dro_loss(group_dro: GroupDRO, groups, per_sample_losses):
+def group_dro_loss(group_dro: GroupDRO, groups, per_sample_losses, update=True):
     device = group_dro.device
 
 
@@ -43,7 +88,8 @@ def group_dro_loss(group_dro: GroupDRO, groups, per_sample_losses):
         else:
             group_losses[g] = 0.0
 
-    group_dro.update(group_losses.detach())
+    if update:
+        group_dro.update(group_losses.detach())
     return group_dro.loss(group_losses)
 
 def variance_group_loss(per_sample_losses, groups, lambda_var=1.0):
@@ -66,10 +112,8 @@ def cvar_loss(per_sample_losses, alpha=0.3):
     if alpha <= 0.0:
         return per_sample_losses.mean()
 
-    # Clamp k to [1, N] so topk never receives k=0
     k = max(1, min(N, int(np.ceil(alpha * N))))
 
-    # topk returns the k LARGEST values — correct for worst-case CVaR
     topk_losses, _ = torch.topk(per_sample_losses, k)
     return topk_losses.mean()
 

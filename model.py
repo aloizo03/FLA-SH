@@ -44,6 +44,11 @@ class NN_model(nn.Module):
 
     IMG_MICRO_BATCH = 128
 
+    # build() only reads X's SHAPE for every model except LSTM_Model (which
+    # sizes its vocabulary from max(X)). When fit() gets a LIST of subsets,
+    # this lets it build from the first subset instead of concatenating them
+    # all into one array first -- for FLA_SHapley's batched path that's ~k
+    # coalitions of the whole train set (tens of GB on CelebA embeddings).
     BUILD_NEEDS_ALL_X = False
 
     def __init__(self, mode_problem='classification', use_img=False,
@@ -64,6 +69,11 @@ class NN_model(nn.Module):
         self.epochs = max_epoch
         self.val_fraction = validation_fraction
         self.early_stop = early_stopping
+        # Minimum improvement that COUNTS as an improvement for early stopping.
+        # A gain smaller than this is treated as a plateau: best_performance is
+        # NOT updated and the patience counter keeps climbing. Without it, noise
+        # of ~1e-4 per epoch resets the counter forever and the run never stops
+        # (e.g. val 0.9920 -> 0.9921 -> 0.9918 -> 0.9923 ... all "improvements").
         self.early_stop_min_delta = early_stop_min_delta
         self.address = address
         self._extra_train_ops = []
@@ -92,6 +102,14 @@ class NN_model(nn.Module):
         self._label_map_inv = None  
  
     
+    def _split_random_state(self):
+        # Optional dedicated RNG for fit()'s train/val split (set as
+        # self.split_rng = np.random.default_rng(seed); used by the
+        # utility-source ablation's noise ceiling). Unset -> None, i.e.
+        # train_test_split draws from the global numpy RNG as before.
+        rng = getattr(self, 'split_rng', None)
+        return None if rng is None else int(rng.integers(2**31 - 1))
+
     def _small_chunk_val_split(self, X, y, fair_attrb=None):
         
         n = X.shape[0] if isinstance(X, np.ndarray) else len(X)
@@ -160,6 +178,7 @@ class NN_model(nn.Module):
             show_progr=False, fair_attrbs=None, fair_attrbs_val=None,
             release_inputs=False):
 
+
         all_y = _flat_labels(y)
         if self.num_classes is None:
             self.num_classes = max(2, len(np.unique(all_y)))
@@ -184,7 +203,6 @@ class NN_model(nn.Module):
  
         if not self.is_built:
             if isinstance(X, list) and X and not self.BUILD_NEEDS_ALL_X:
-                # Shape is all build() needs -- see BUILD_NEEDS_ALL_X.
                 first = X[0]
                 all_X = first.to_numpy() if hasattr(first, 'to_numpy') else np.asarray(first)
             elif isinstance(X, list):
@@ -201,12 +219,14 @@ class NN_model(nn.Module):
             else:
                 all_X = np.asarray(X)
  
+            if getattr(self, 'feature_transform', None) is not None:
+                all_X = self.feature_transform(all_X)
             self.build(all_X, all_y)
-            del all_X   # otherwise held for the whole training run
+            del all_X
 
         fair_train = None
         fair_val = None
-        owns_split = False   # True once X_train_lst/X_val_lst are lists fit() built itself
+        owns_split = False
  
         if X is None or len(X) == 0:
             return
@@ -231,9 +251,9 @@ class NN_model(nn.Module):
                         Xt, Xv, yt, yv, ft, fv = self._small_chunk_val_split(X, y, fa)
                     else:
                         if self.use_fairness and fa is not None:
-                            Xt, Xv, yt, yv, ft, fv = train_test_split(X, y, fa, test_size=self.val_fraction)
+                            Xt, Xv, yt, yv, ft, fv = train_test_split(X, y, fa, test_size=self.val_fraction, random_state=self._split_random_state())
                         else:
-                            Xt, Xv, yt, yv = train_test_split(X, y, test_size=self.val_fraction)
+                            Xt, Xv, yt, yv = train_test_split(X, y, test_size=self.val_fraction, random_state=self._split_random_state())
                             ft = None
                             fv = None
                     X_train_lst.append(Xt)
@@ -251,9 +271,9 @@ class NN_model(nn.Module):
                             Xt, Xv, yt, yv, ft, fv = self._small_chunk_val_split( X_, y_, fa_)
                         else:
                             if self.use_fairness and fa_ is not None:
-                                Xt, Xv, yt, yv, ft, fv = train_test_split(X_, y_, fa_, test_size=self.val_fraction)
+                                Xt, Xv, yt, yv, ft, fv = train_test_split(X_, y_, fa_, test_size=self.val_fraction, random_state=self._split_random_state())
                             else:
-                                Xt, Xv, yt, yv = train_test_split(X_, y_, test_size=self.val_fraction)
+                                Xt, Xv, yt, yv = train_test_split(X_, y_, test_size=self.val_fraction, random_state=self._split_random_state())
                                 ft = None
                                 fv = None
                         X_train_lst.append(Xt)
@@ -345,7 +365,8 @@ class NN_model(nn.Module):
  
         self.history = {'metrics': [], 'idxs': [], 'keys': []}
         stop_counter = 0
-        higher_is_better = self.metric in ['accuracy', 'auc', 'f1']
+        monitor_loss = getattr(self, 'early_stop_monitor', 'val_loss') == 'val_loss'
+        higher_is_better = (not monitor_loss) and self.metric in ['accuracy', 'auc', 'f1']
         best_performance = -np.inf if higher_is_better else np.inf
 
         _momentum = getattr(self, 'momentum', 0.0)
@@ -362,14 +383,19 @@ class NN_model(nn.Module):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimiser, T_max=max_epochs)
 
+        feature_transform = getattr(self, 'feature_transform', None)
+
+        def _prep(a):
+            return feature_transform(a) if feature_transform is not None else preprocessing.normalize(a)
+
         def _normalize_list(lst):
             if normalize_inplace:
                 for i, a in enumerate(lst):
-                    lst[i] = preprocessing.normalize(a) if a is not None else None
+                    lst[i] = _prep(a) if a is not None else None
                 return lst
-            return [preprocessing.normalize(a) if a is not None else None for a in lst]
+            return [_prep(a) if a is not None else None for a in lst]
 
-        if self.normalize:
+        if self.normalize or feature_transform is not None:
             if isinstance(X, list):
                 if not self.use_img:
                     X = _normalize_list(X)
@@ -377,15 +403,19 @@ class NN_model(nn.Module):
                         if isinstance(X_val, list):
                             X_val = _normalize_list(X_val)
                         elif isinstance(X_val, np.ndarray):
-                            X_val = preprocessing.normalize(X_val)
+                            X_val = _prep(X_val)
             elif isinstance(X, np.ndarray):
                 if not self.use_img:
-                    X = preprocessing.normalize(X)
+                    X = _prep(X)
                     if X_val is not None:
                         if isinstance(X_val, list):
-                            X_val = [preprocessing.normalize(a) if a is not None else None for a in X_val]
+                            X_val = [_prep(a) if a is not None else None for a in X_val]
                         elif isinstance(X_val, np.ndarray):
-                            X_val = preprocessing.normalize(X_val)
+                            X_val = _prep(X_val)
+            elif isinstance(X, pd.DataFrame) and feature_transform is not None and not self.use_img:
+                # A bare DataFrame (get_score's use_val=False fit) was never
+                # L2-normalised; only the new transform is applied to it.
+                X = _prep(X)
 
         loss_fair_fn = None
         if self.use_fairness and self.fair_metric == 'groupdro':
@@ -405,7 +435,11 @@ class NN_model(nn.Module):
             if scheduler is not None:
                 scheduler.step()
 
-            current_performance = (np.mean(val_metrics) if (use_val and val_metrics) else float('nan'))
+            if monitor_loss:
+                current_performance = (np.mean(self._epoch_val_losses)
+                                       if (use_val and self._epoch_val_losses) else float('nan'))
+            else:
+                current_performance = (np.mean(val_metrics) if (use_val and val_metrics) else float('nan'))
  
             if epoch % 10 == 0 and show_progr:
                 print(f'Epoch {epoch}/{max_epochs}, '
@@ -432,6 +466,7 @@ class NN_model(nn.Module):
                        use_val, batch_size, optimiser, data_dict=None, loss_fair_fn=None):
         val_metrics = []
         keys_lst = []
+        self._epoch_val_losses = []   # mean val loss per validation() call (early stopping)
  
         if self.use_img:
             if data_dict is None:
@@ -486,8 +521,11 @@ class NN_model(nn.Module):
                 if X_val_batch.ndim == 1:
                     X_val_batch = X_val_batch.unsqueeze(0)
 
-            optimiser.zero_grad()
+            fixed_val = getattr(self, 'fixed_val_data', None)
+            if has_val and fixed_val is not None:
+                X_val_batch, y_val_batch = fixed_val
 
+            optimiser.zero_grad()
             X_np = np.asarray(X_batch) if isinstance(X_batch, list) else X_batch
             if isinstance(X_np, np.ndarray) and X_np.ndim == 5 and X_np.shape[0] == 1:
                 X_np = X_np[0]
@@ -561,6 +599,7 @@ class NN_model(nn.Module):
                                              loss_fn=loss_fn_none,
                                              loss_fair_fn=loss_fair_fn if self.use_fairness else None)
                 val_metrics.append(val_metric)
+                self._epoch_val_losses.append(self._last_val_loss)
 
         return idxs, val_metrics, keys_lst
  
@@ -662,21 +701,23 @@ class NN_model(nn.Module):
                 val_loss_per_sample = loss_fn(y_pred, y)
                 if val_loss_per_sample.ndim > 1:
                     val_loss_per_sample = val_loss_per_sample.mean(dim=1)
+            self._last_val_loss = float(val_loss_per_sample.mean().item())
  
             y_true = y.cpu().numpy()
             metric_val = get_metric(metric=self.metric,
                                     y_pred=y_pred_metric, y=y_true,
                                     use_fairness=self.use_fairness)
-
+            if self.compute_Shapley and getattr(self, 'utility', 'accuracy') == 'neg_val_ce':
+                metric_val = -self._last_val_loss
             if self.use_fairness and fair_val is not None and self.compute_Shapley:
                 n = val_loss_per_sample.shape[0]
                 if len(fair_val) != n:
                     fair_val = fair_val[:n]
 
                 if self.fair_metric == 'groupdro':
-                    metric_val -= (self.lambda_fair * group_dro_loss(loss_fair_fn, fair_val, val_loss_per_sample)).item()
+                    metric_val -= (self.lambda_fair * group_dro_loss(loss_fair_fn, fair_val, val_loss_per_sample, update=False)).item()
                 elif self.fair_metric == 'cvar':
-                    metric_val -= cvar_loss(per_sample_losses=val_loss_per_sample).item()
+                    metric_val -= (self.lambda_fair * cvar_loss(per_sample_losses=val_loss_per_sample)).item()
                 elif self.fair_metric == 'varianceloss':
                     metric_val -= variance_group_loss(groups=fair_val, per_sample_losses=val_loss_per_sample, lambda_var=1).item()
 
@@ -814,14 +855,7 @@ class CNN_Model(NN_model):
 
 
 class LogisticRegression_Model(NN_model):
-    """(Multinomial) logistic regression trained with SGD for tabular data.
-
-    A single linear layer maps the features straight to class logits (or to a
-    single scalar for regression). The base trainer's CrossEntropyLoss applies
-    the softmax, so this is a plain logistic / softmax regressor with no hidden
-    layers. Set ``optimizer='sgd'`` (the default in ``create_model``) to train
-    it with stochastic gradient descent.
-    """
+    """(Multinomial) logistic regression trained with SGD for tabular data."""
 
     def build(self, X, y, bias=True, init_=True, data_dict=None):
         self.is_built = True
@@ -843,15 +877,8 @@ class LogisticRegression_Model(NN_model):
         self.layers_.add_module('logit_layer', linear)
 
 
-
 def _group_norm(num_channels, max_groups=32, device=None):
-    """GroupNorm with a group count that divides num_channels.
-
-    GroupNorm (not BatchNorm) is used because this data-Shapley pipeline trains
-    with very small / single-sample batches (batch_size=1 during value
-    estimation), which BatchNorm cannot handle ("Expected more than 1 value per
-    channel"). GroupNorm is batch-size independent, so it is robust here.
-    """
+    """GroupNorm with a group count that divides num_channels."""
     num_groups = min(max_groups, num_channels)
     while num_groups > 1 and num_channels % num_groups != 0:
         num_groups -= 1
@@ -859,11 +886,7 @@ def _group_norm(num_channels, max_groups=32, device=None):
 
 
 class _BasicBlock(nn.Module):
-    """Standard two-conv residual block (He et al., 2016).
-
-    Applies two 3x3 convolutions with GroupNorm and a ReLU, plus an identity
-    (or 1x1-projection) shortcut that is added back before the final ReLU.
-    """
+    """Standard two-conv residual block (He et al., 2016)."""
     expansion = 1
 
     def __init__(self, in_channels, out_channels, stride=1, device=None):
@@ -890,8 +913,7 @@ class _BasicBlock(nn.Module):
 
 
 class AlexNet_Model(NN_model):
-    """AlexNet-STYLE CNN (Krizhevsky et al., 2012)
-    """
+    """AlexNet-STYLE CNN (Krizhevsky et al., 2012)"""
 
     def __init__(self, mode_problem='classification', use_img=True,
                  hidden_layers=[1024, 1024], optimizer='sgd', batch_size=128,
@@ -913,7 +935,7 @@ class AlexNet_Model(NN_model):
         self.lr_schedule = lr_schedule
         self.pixel_mean = pixel_mean
         self.pixel_std = pixel_std
-        self.pool_size = pool_size          # AdaptiveAvgPool2d target (pool_size x pool_size)
+        self.pool_size = pool_size
 
     def build(self, X, y, bias=True, init_=True, data_dict=None):
         self.is_built = True
@@ -935,13 +957,10 @@ class AlexNet_Model(NN_model):
                 _group_norm(c_out, device=dev),
                 nn.ReLU(inplace=True))
 
-        # Stage 1: conv -> pool   (AlexNet conv1 + pool1)
         self.stage1 = nn.Sequential(conv_gn_relu(in_channels, 64),
                                     nn.MaxPool2d(kernel_size=2, stride=2))
-        # Stage 2: conv -> pool   (AlexNet conv2 + pool2)
         self.stage2 = nn.Sequential(conv_gn_relu(64, 192),
                                     nn.MaxPool2d(kernel_size=2, stride=2))
-        # Stage 3: conv -> conv -> conv -> pool   (AlexNet conv3/4/5 + pool5)
         self.stage3 = nn.Sequential(conv_gn_relu(192, 384),
                                     conv_gn_relu(384, 256),
                                     conv_gn_relu(256, 256),
@@ -950,7 +969,6 @@ class AlexNet_Model(NN_model):
         self.global_pool = nn.AdaptiveAvgPool2d((self.pool_size, self.pool_size))
         flat_dim = 256 * self.pool_size * self.pool_size
 
-        # FC head (AlexNet FC6/FC7/FC8, widths scaled down from 4096->1024)
         self.dense_net = nn.Sequential()
         cur_dim = flat_dim
         for i, h in enumerate(self.hidden_layers):
@@ -1007,14 +1025,7 @@ class AlexNet_Model(NN_model):
 
 
 class ResNet_Model(NN_model):
-    """ResNet backbone trained with SGD for image datasets.
-
-    A CIFAR/MNIST-style residual network: a 3x3 stem, a configurable stack of
-    residual stages (``num_blocks`` blocks each, channels doubling and spatial
-    size halving per stage after the first), global average pooling, optional
-    dense ``hidden_layers``, and a linear classifier. Set ``optimizer='sgd'``
-    (the default in ``create_model``) to train it with SGD.
-    """
+    """ResNet backbone trained with SGD for image datasets."""
 
     def __init__(self, mode_problem='classification', hidden_layers=[],
                  optimizer='sgd', batch_size=128, max_epoch=100,
@@ -1035,7 +1046,6 @@ class ResNet_Model(NN_model):
                          lambda_fair, fair_metric, compute_Shapley)
         self.base_channels = base_channels
         self.num_blocks = num_blocks
-
         self.momentum = momentum
         self.weight_decay = weight_decay
         self.lr_schedule = lr_schedule
@@ -1155,11 +1165,11 @@ class _SoftTree(nn.Module):
     def forward(self, X):
         probs = torch.ones(X.shape[0], 1, device=X.device, dtype=X.dtype)
         for lin in self.level_linears:
-            gate = torch.sigmoid(lin(X))            # P(go right) per node at this level
+            gate = torch.sigmoid(lin(X))
             left = probs * (1 - gate)
             right = probs * gate
             probs = torch.stack([left, right], dim=2).reshape(X.shape[0], -1)
-        return probs @ self.leaf_logits              # (batch, out_dim)
+        return probs @ self.leaf_logits
 
 
 class SoftDecisionTree_Model(NN_model):
@@ -1199,8 +1209,7 @@ class SoftDecisionTree_Model(NN_model):
 
 
 class BoostedTree_Model(NN_model):
-    """Additive ensemble of differentiable soft decision trees ("boosted
-    tree"), trained jointly with SGD."""
+    """Additive ensemble of differentiable soft decision trees ("boosted tree"), trained jointly with SGD. """
 
     def __init__(self, mode_problem='classification', use_img=False,
                  hidden_layers=[100], optimizer='sgd', batch_size=128,
@@ -1242,10 +1251,8 @@ class BoostedTree_Model(NN_model):
 
 
 class _ObliviousTree(nn.Module):
-    """A single "oblivious" differentiable decision tree, as used by NODE
-    (Popov, Morozov & Babenko, "Neural Oblivious Decision Ensembles for Deep
-    Learning on Tabular Data", ICLR 2020).
-    """
+    """A single "oblivious" differentiable decision tree, as used by NODE (Popov, Morozov & Babenko,
+       "Neural Oblivious Decision Ensembles for Deep Learning on Tabular Data", ICLR 2020)."""
 
     def __init__(self, in_dim, depth, out_dim, device=None, init_=True):
         super().__init__()
@@ -1279,9 +1286,7 @@ class _ObliviousTree(nn.Module):
 
 
 class NODE_Model(NN_model):
-    """NODE: Neural Oblivious Decision Ensembles (Popov, Morozov & Babenko,
-    ICLR 2020), trained end-to-end with standard SGD/Adam.
-    """
+    """NODE: Neural Oblivious Decision Ensembles (Popov, Morozov & Babenko, ICLR 2020), trained end-to-end with standard SGD/Adam."""
 
     def __init__(self, mode_problem='classification', use_img=False,
                  hidden_layers=[100], optimizer='sgd', batch_size=128,
