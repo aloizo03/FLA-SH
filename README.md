@@ -90,8 +90,23 @@ Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, 
 #### Fairness settings
 - `use_fairness=True` → enables fairness in the Shapley calculation
 - `fairness_attr='gender'` → the dataset column whose subpopulation groups are examined for fairness
-- `lambda_fair=1.0` → the weight of the fairness loss in the total Shapley contribution, in the range [0,
+- `lambda_fair=1.0` → the weight of the fairness loss in the total Shapley contribution, in the range [0, 1]
 - `fair_metric` → `'groupdro'` (Group-DRO, η = 0.1) or `'cvar'` (CVaR over the worst 30% of per-sample losses)
 
 ### Training notes
-- Task-model retraining uses plain SGD, with early stopping on **validation loss** (patience 5). Set `modic'` to stop on the validation metric instead.
+- Task-model retraining uses plain SGD, with early stopping on **validation loss** (patience 5). Set `model.early_stop_monitor = 'metric'` to stop on the validation metric instead.
+
+### Reproducing the experiments
+- Tabular datasets (Adult, Bank Marketing, Covertype, MIMIC-III):
+  ```
+  python run_vldb_tabular_experiment.py --chunk-size 256 --r-max 2
+  ```
+- Image datasets (CIFAR-10, MNIST, F-MNIST):
+  ```
+  python run_vldb_image_experiment.py --early-stopping <patience> --r-max 2
+  ```
+- Full-data baselines, with no valuation and no removal (train / val / test accuracy):
+  ```
+  python run_full_data_baseline.py
+  python run_full_data_baseline_images.py --early-stopping <patience>
+  ```
