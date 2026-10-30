@@ -99,14 +99,9 @@ Shap_values_dict, shap_values_average = DS.execute_per_dataset(split_data=True, 
 ### Reproducing the experiments
 - Tabular datasets (Adult, Bank Marketing, Covertype, MIMIC-III):
   ```
-  python run_vldb_tabular_experiment.py --chunk-size 256 --r-max 2
+  python run_tabular_experiment.py --chunk-size 256 --r-max 2
   ```
 - Image datasets (CIFAR-10, MNIST, F-MNIST):
   ```
-  python run_vldb_image_experiment.py --early-stopping <patience> --r-max 2
-  ```
-- Full-data baselines, with no valuation and no removal (train / val / test accuracy):
-  ```
-  python run_full_data_baseline.py
-  python run_full_data_baseline_images.py --early-stopping <patience>
+  python run_image_experiment.py --early-stopping <patience> --r-max 2
   ```
